@@ -1,0 +1,1058 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+##
+# Gitlab Code Search spiced up for shell with syntax highlighting (using bat) and Regex Search (oniguruma)
+#
+# @license GPLv3 (https://www.gnu.org/licenses/gpl-3.0.en.html)
+# @author Markus Geiger <mg@evolution515.net>
+# @author Markus Geiger <markus.geiger@nielsen.com>
+
+GITLAB_TOKEN="${GITLAB_TOKEN:-}"
+LINES_BEFORE=2
+LINES_AFTER=2
+GLAB_LINES_BEFORE=2
+GLAB_LINES_AFTER=2
+ID_FRAGMENT=""  # group or project path in query
+OUTPUT_FORMAT="rg"
+RESULTS_LIMIT=200
+TMP=""
+SEARCH_QUERY=""
+REGEX_INCLUDE=""
+REGEX_EXCLUDE=""
+OUTPUT_DIRECTORY=""
+FULL_RESULTS=0
+REGEX_FILTER_AROUND_MATCHES_ONLY=0
+ALWAYS_YES=0
+BASENAME="${0##*/}"
+DEBUG=0
+COLORIZE=-1
+PER_PAGE=100 # 100 is gilab's max page size
+VERSION="0.1"
+
+function shutdown {
+	if [[ "$DEBUG" -ne 1 ]] && [[ -d "$TMP" ]]; then
+		rm -fr "$TMP"
+	fi
+}
+
+function remove-ansi-color {
+	sed -r 's/(\x1b\[[0-9;]+m)//g'
+}
+
+function normalize-path {
+	local path="${1?path}"
+	path="/${path#/*}"
+	printf "%s" "${path%*/}"
+}
+
+function get-namespace-info {
+	local namespace="${1?namespace}"
+	namespace="${namespace#/*}"
+	namespace="${namespace%*/}"
+	# first call is to check if token is valid
+	curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/user" 1>/dev/null \
+		&& (curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/groups/$(jq -Rr @uri <<< "$namespace")/" 2>/dev/null | jq --arg ns "$namespace" '{id, name, path: $ns, description, type:"group"}')  \
+		|| (curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$(jq -Rr @uri <<< "$namespace")/" 2>/dev/null | jq --arg ns "$namespace"  '{id, name, path: $ns, description, type:"project"}') \
+		|| raise-error "Namespace ${namespace} could not be found!"
+}
+
+# usage if-debug && "stuff" || true
+function if-debug {
+	[[ "$DEBUG" -ne 0 ]]
+}
+
+function is-color {
+	if  [[ "$COLORIZE" -eq 1 ]] || ( [[ "$COLORIZE" -eq -1 ]] && [[ -t 1 ]] ); then
+		COLORIZE=1
+		return 0
+	fi
+	return 1
+}
+
+
+function debug {
+  if [[ "$DEBUG" -eq 0 ]]; then
+ 		return
+  fi
+  local tmpl="%s\n"
+  if is-color; then
+			tmpl="\e[1m\e[31m\e[38;2;255;0;255m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${*?message}" >&2
+
+}
+
+function err {
+	local tmpl="%s\n"
+	if is-color; then
+			tmpl="\e[1m\e[31m\e[38;2;196;0;32m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+function warn {
+	local tmpl="%s\n"
+	if is-color; then
+			tmpl="\e[3m\x1b[38;2;255;100;0m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+function info {
+	local tmpl="%s\n"
+	if is-color; then
+			tmpl="\e[1m\e[35m\x1b[38;2;255;192;64m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+function label {
+    local len="${2:-1}"
+  	local tmpl="%-${len}s"
+		if is-color; then
+				tmpl="\e[37m\e[1m\x1b[38;2;255;255;255m%-${len}s\x1b[0m"
+  	fi
+  	printf "$tmpl" "${1?label}" >&2
+}
+
+function notice {
+	local tmpl="%s\n"
+	if is-color; then
+			tmpl="\e[37m\x1b[38;2;128;128;164m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+function href {
+	local href="${1}"
+	local text="${2:-$1}"
+	if is-color; then
+			printf "\e]8;;%s\a%s\e]8;;\a" "$href" "$text" 
+			return
+  fi
+	printf "%s" "$text" 
+}
+
+
+function raise-error() {
+	local message="${1?error-message}"
+	local exit_code="${2:-1}"
+	err "$BASENAME: $message"
+	exit "$exit_code"
+}
+
+function colorize-by-regex {
+	local regex="${1?regex}"
+	jq -Rr --arg in $'\x1b''[0;30;46m'  --arg clear $'\x1b''[0m' '.|gsub("(?<a>i)";"|\($in+.a+$clear)|";"g")'      
+}
+
+confirm() {
+    read -sn 1 -p "$* [y/N]? " 
+    [[ ${REPLY:0:1} = [Yy] ]]
+}
+
+
+function hypercurl {
+	local url="${1?url}"
+	local pagecount="1"
+	local page=1
+	local per_page=-1
+	local total_pages=-1
+	local expected_results=0
+	mkfifo "$TMP/headers" 
+	mkfifo "$TMP/var" 
+	(
+			while read -r line; do
+				if [[ "$line" =~ x-total-pages:\ ([0-9]+) ]]; then
+					printf "total_pages=%d\n" "${BASH_REMATCH[1]}"
+				fi
+				if [[ "$line" =~ x-page:\ ([0-9]+) ]]; then
+					printf "page=%d\n" "${BASH_REMATCH[1]}"
+				fi
+				if [[ "$line" =~ x-per-page:\ ([0-9]+) ]]; then
+					printf "per_page=%d\n" "${BASH_REMATCH[1]}"
+				fi
+
+			done < "$TMP/headers"  > "$TMP/var" 
+	) &
+	printf "\e[2K\rWaiting for results" >&2
+	
+	
+	curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$url" -D "$TMP/headers" | jq -c '.[]' > "$TMP/results.jsonl"
+	source /dev/stdin < "$TMP/var" 
+	expected_results=$((total_pages * per_page))
+	
+	if [[ "$ALWAYS_YES" -ne 1 ]] && [[ "$expected_results" -gt "$RESULTS_LIMIT" ]]; then
+		printf "\e[2K\r" >&2
+		confirm "More than $expected_results (>$RESULTS_LIMIT) results expected. Continue?" >&2
+	fi
+
+	if [[ "$page" -eq 1 ]] && [[ "$total_pages" -gt 1 ]]; then
+		(
+			mkdir "$TMP/pages"
+			for ((i=page+1;i<=total_pages;i++)); do
+				cat <<-EOM 
+				url=${url}&page=$i
+				-o $TMP/pages/$i.json
+				EOM
+			done 
+		) > "$TMP/curl-urls"		
+		(
+			
+			while read -r line; do
+				if [[ "$line" =~ HTTP/[0-9\.]\ 200 ]]; then
+					let 'pagecount+=1'
+					printf "\e[2K\r%s of %s pages retrieved"  "$pagecount" "$total_pages" >&2
+				fi
+				
+			done < "$TMP/headers" 
+		) &
+		
+		curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" --parallel --config "$TMP/curl-urls" -D "$TMP/headers"   \
+			| jq -cr '
+				.[]
+			' 
+		cat "$TMP/pages/"* | jq -c '.[]' >> "$TMP/results.jsonl"
+		rm -fr "$TMP/pages"
+	fi
+	
+	rm "$TMP/headers"
+	printf "\e[2K\r" >&2
+}
+
+
+# Resolve project ID in search reuslts to full project pathes with namespace 
+function resolve-project-ids-to-full-pathes {
+	local graphql=""
+	local input="${1?search-results}"
+	local tmp="${input%/*}"
+	
+	jq -s '[.[].project_id]|unique|map("gid://gitlab/Project/\(.)")|{project_ids:.}' "$input" \
+		> "$tmp/.variables.jsonl"
+
+	IFS="" readarray -d '' query <<-EOQ
+		query getProjectIds(\$project_ids: [ID!]) {
+		  projects(ids: \$project_ids) {
+		    nodes {
+		      id
+		      fullPath
+		    }
+		  }
+		}
+	EOQ
+
+	QUERY="$(jq -nc --slurpfile vars "$tmp/.variables.jsonl" --arg query "$query" '{
+		query: $query,
+		variables: $vars[0]
+	}')"
+	
+
+	# restish  post "https://gitlab.com/api/graphql" <<< "$QUERY"
+	curl -sSfL "https://gitlab.com/api/graphql" --header "Authorization: Bearer $GITLAB_TOKEN" \
+    	--header "Content-Type: application/json" --request POST \
+		--data "$QUERY" \
+		| jq -r '[.data.projects.nodes[] as $r|{id: ($r.id|scan("\\d+")|tonumber), full_path: $r.fullPath}]' \
+		> "$tmp/project-mapping.json"
+
+	jq -cs --slurpfile mapping "$tmp/project-mapping.json" \
+		'map(. as $p|.|=.*($mapping[][]|select(.id==$p.project_id))//{})[]' "$input"
+}
+
+function assert {
+	local value="${1?value}"
+	local regex="${2?regex}"
+	local message="${3?message}"
+	if [[ ! "$value" =~ ^($regex)$ ]]; then
+		raise-error "expected: $message"
+	fi
+	printf "%s" "$value"
+}
+
+
+function usage {
+	# https://github.com/danielgtaylor/restish
+	cat <<-EOM
+		Gitlab Code Search spiced up for shell with syntax highlighting (using bat) and Regex Search (oniguruma)
+
+		USAGE
+
+		  ${0##*/} [OPTIONS] QUERY […QUERY]
+		
+
+		OPTIONS 
+
+		  -g|--group <group-id-or-path>      Start searching from this Group (will not be resolved)
+		  -p|--project <project-id-or-path>  Start searching from this Project (will not be resolved)
+		  -n|--namespace                     Start searching from this Namespace (will be resolved)
+
+		                                     Last spec will take precedence and overwrite
+
+		  -B|--before <n>                    Context Lines Before (Gitlab Default = 2)
+		  -A|--after <n>                     Context Lines After (Gitlab Default = 2)
+
+		  -o|--only-matching                 Show only matching lines (sets lines before and after to zero)
+		  -r|--results                       Apply regex filter around original matches only 
+		                                     (otherwise a regex search will always download complete files)
+
+		  -d|--download                      Force download of complete files
+		  -y|--yes                           Answer yes to download
+
+		  
+		  -f|--format <format>               Specify output format (choose from below)
+
+		  -j|--json                          JSON Output
+		  --jsonl                            JSONL Output
+		  --files                            Only output list of matched files 
+		  --projects                         Only output list of matched projects
+		  --matches                          Only output list of matched files and line numbers
+		  --grep                             Grep Output (Default)
+		  --rg--rg|--ack|--ag                Ack-like Output format (like Ripgrep Default)
+		  --ack                              Long Output format (like Ripgrep Default)
+		  --tar                              Output a tarball containing all the files and a results.jsonl
+		                                     (will imply to download all files)
+		  --full                             Output filenames on stderr and full file contents on stdout
+		                                     (so can do a qucik 'nmc-codesearch --full nmcapps_docker_host_load | grep DOCKER_HOST')
+
+		  -c|--color                         Enforce color
+		  -C|--no-color                      Disable color
+
+		                                     Colorization is done automatically
+		  -H|--highlight <regex>             Highlight by regex
+
+		  -h|--help)	                       Help
+
+
+		PLANNED TO IMPLEMENT 
+
+		  -x|--exclude-namespaces            Exclude projects or groups (seperated by comma, understands glob or regex)
+		  -X|--exclude-files                 Exclude files (seperated by comma, understands glob or regex)	
+
+		
+		QUERY MODIFIERS 
+
+		  "   Exact search   "gem sidekiq"
+
+		  ~   Fuzzy search    J~ Doe
+
+		  |   Logical OR      display | banner
+
+		  +   Logical AND     display +banner
+
+		  -   Exclude         display -banner
+
+		  *   Partial         bug error 50*
+
+		  \   Escape Char     \*md
+
+		
+		QUERY SYNTAX (code search)
+
+				 <QUERY>            Search in code             DOCKER_HOST
+
+		  filename:, fn:     Filename                   filename:*spec.rb
+		  path:              Repository location        path:spec/workers/
+
+		  ext:, extension:   File extension without .   extension:js
+		  blob:              Git object ID              blob:998707*
+
+                            'extension:' and 'blob:' do return exact matches only!
+
+
+		QUERY SYNTAX (code search)
+
+		  Regex can only be specified if you used a regular search sytnax before.
+
+		  rg:                Regex                      rg:project:\s.+templates
+		  not:               Regex (inverse)            rg:project:\s.+templates 
+
+
+		  Regex is not implemented by Gitlab API and requires to download regularly matching files before,
+		  except your specify -r flag
+
+
+		QUERY EXAMPLES
+
+		  rails -filename:gemfile.lock
+		  Returns rails in all files except the gemfile.lock file.
+
+		  RSpec.describe Resolvers -*builder
+		  Returns RSpec.describe Resolvers that does not start with builder.
+
+		  bug | (display +banner)
+		  Returns bug or both display and banner.
+
+		  helper -extension:yml -extension:js
+		  Returns helper in all files except files with a .yml or .js extension.
+
+		USAGE EXAMPLES
+
+		  glab-codesearch -p myproject -j example | jq '.data|length'
+
+	EOM
+	
+}
+
+function set-output-dir {
+	local directory="${1?directory}"
+	directory="${directory%/}"
+	if [[ ! -d "$directory" ]]; then
+			raise-error "$(readlink -f "$directory") does not exist!"
+	fi
+	OUTPUT_DIRECTORY="$(readlink -f "$directory")"
+}
+
+function init-args {
+	local rgsearch=0
+	local opt
+	local resolve_path=""
+	local regex_include=()
+	local regex_exclude=()
+
+	if [[ $# -eq 0 ]]; then
+		usage
+		exit 1
+	fi
+
+	while [[ $# -gt 0 ]]; do
+		arg="$1"
+		shift 1
+		case "$arg" in
+			-B|--before)
+				LINES_BEFORE="${1?before}"
+				if [[ $LINES_BEFORE -gt $GLAB_LINES_BEFORE ]]; then
+					FULL_RESULTS=1
+				fi
+				shift 1
+				;;
+			-A|--after)
+				LINES_AFTER="${1?after}"
+				if [[ $LINES_AFTER -gt $GLAB_LINES_AFTER ]]; then
+					FULL_RESULTS=1
+				fi
+				shift 1
+				;;
+
+			-o|--only-results)
+				LINES_BEFORE=0
+				LINES_AFTER=0
+				COLORIZE=0
+				;;
+
+			-g|--group)
+				opt="$(assert "${1:-}" '([0-9]|[a-z0-9\_/-]+)' "-g <group-id-or-path>" )"
+				opt="${opt#/*}"
+				opt="${opt%*/}"
+				resolve_path=""
+				shift 1
+				ID_FRAGMENT="groups/$(jq -Rr '@uri' <<< "$opt")"
+				;;
+
+			-p|--project)
+				opt="${1?project-id-or-path}"
+				opt="${opt#/*}"
+				opt="${opt%*/}"
+				resolve_path=""
+				shift 1
+				ID_FRAGMENT="projects/$(jq -Rr '@uri' <<< "$opt")"
+				;;
+
+			-n|--namespace)
+				opt="$(assert "${1:-}" '[a-z0-9\_/-]+' "-g <group-or-project-path>" )"			
+				resolve_path="$(normalize-path "$opt")"
+				shift 1
+				;;
+
+			-d|--download)
+				FULL_RESULTS=1
+				;;
+
+			--debug)
+				DEBUG=1
+				;;
+			
+			-f|--format)
+				OUTPUT_FORMAT="${1?output-format}"
+				shift 1
+				;;
+
+			-h|--help)
+				usage
+				exit 0
+				;;
+
+			-c|--color)
+				COLORIZE=1
+				;;
+
+			-C|--no-color)
+				COLORIZE=0
+				;;
+
+			-y|--yes)
+				ALWAYS_YES=1
+				;;
+
+			-r)
+				REGEX_FILTER_AROUND_MATCHES_ONLY=1
+				;;
+
+			-j)
+				OUTPUT_FORMAT='json'
+				;;
+
+			--grep|--list|--json|--jsonl|--hits|--grep|--rg|--ndjson|--full|--matches|--projects|--files)
+				OUTPUT_FORMAT="${arg#--}"
+				;;
+
+			--dir)
+				opt="${1?directory}"
+				shift 1
+				set-output-dir "$opt"
+				OUTPUT_FORMAT="${arg#--}"
+				;;
+
+			--tar)
+				OUTPUT_FORMAT="tar"
+				;;
+			-v|--version)
+				echo "$BASENAME, v$VERSION"
+				exit 0
+				;;
+
+			-[a-zA-Z]*)
+				set -- $(for ((i=1; i<${#arg}; i++ )); do echo " -${arg:$i:1}"; done) "$@"
+				;;
+
+			filename:*|fn:*|file:*)
+				opt="${arg#*:}"
+				SEARCH_QUERY="filename:${opt} $SEARCH_QUERY"
+				;;
+			path:*|path:*)
+				opt="${arg#*:}"
+				SEARCH_QUERY="path:${opt} $SEARCH_QUERY"
+				;;
+			extension:*|ext:*)
+				opt="${arg#*:}"
+				SEARCH_QUERY="extension:${opt} $SEARCH_QUERY"
+				;;
+			include:*|rg:*|regex:)
+				arg="${arg#*:}"
+				check-regex "$arg"
+				regex_include+=("${arg}")			
+				;;
+			exclude:*|not:*)
+				arg="${arg#*:}"
+				check-regex "$arg"
+				regex_exclude+=("${arg}")
+				;;
+
+			*) 
+				SEARCH_QUERY="${SEARCH_QUERY}${SEARCH_QUERY:+ }${arg}"
+				;;
+		esac
+	done
+	
+	if [[ "$OUTPUT_FORMAT" =~ ^(tar|dir|full)$ ]]; then
+			# download all files with tar
+			FULL_RESULTS=1
+	fi
+
+	if [[ "${#regex_include[@]}" -gt 0 ]]; then
+		REGEX_INCLUDE="($( IFS=\| ; echo "${regex_include[*]}"))"
+		if [[ "$REGEX_FILTER_AROUND_MATCHES_ONLY" -eq 0  ]]; then
+			FULL_RESULTS=1
+		fi
+	fi
+
+	if [[ "${#regex_exclude[@]}" -gt 0 ]]; then
+		REGEX_EXCLUDE="($( IFS=\| ; echo "${regex_exclude[*]}"))"
+		if [[ "$REGEX_FILTER_AROUND_MATCHES_ONLY" -eq 0  ]]; then
+			FULL_RESULTS=1
+		fi
+	fi
+
+	if [[  -z "$GITLAB_TOKEN" ]]; then
+		raise-error "GITLAB_TOKEN needs to be set"
+	fi
+
+	if [[ "$OUTPUT_FORMAT" == "path" ]] && [[ "$FULL_RESULTS" -eq 1 ]]; then
+		raise-error "unsupported options: cannot use full results with path output"
+	fi
+
+	if [[ -z "$GITLAB_TOKEN" ]]; then
+		raise-error "please provide GITLAB_TOKEN"
+	fi
+
+	if [[ -n "$resolve_path" ]]; then
+		ID_FRAGMENT="$(get-namespace-info "$resolve_path" | jq -r '"\(.type)s/\(.id)"' 2>/dev/null )"
+		if [[ -z "$ID_FRAGMENT" ]]; then
+			raise-error "could not resolve $ID_FRAGMENT"
+		fi
+		debug "Namespace $resolve_path was resolved to $ID_FRAGMENT"
+	fi
+
+	if [[ -z "$ID_FRAGMENT" ]]; then
+		raise-error "please provide project or group to search"
+	fi
+	if [[  -z "$SEARCH_QUERY" ]]; then
+		raise-error "please provide a search query"
+	fi
+	
+}
+
+function check-regex {
+	local regex="${1?regex}"
+	if ! jq -n --arg regex "$regex" '""|test($regex)' 1>/dev/null 2>"$TMP/stderr"; then
+		err "Invalid regex: $regex"
+		err "$(cat $TMP/stderr | cut -c27-)"
+		exit 2
+	fi
+}
+
+
+function auniq {
+	awk '!a[$0]++'
+}
+
+function request {
+	local project_id=""
+	local filename=""
+	local extension=""
+	local json
+	local tmpfile
+	local jq_filter_args=()
+	local jq_filter=0
+	local url=""
+	local hash=""
+
+	# restish will auto-paginate according to hypermedia specs
+	debug "Searching for ${SEARCH_QUERY@Q} on $ID_FRAGMENT"
+	#timeout 60 restish -rojson -f body \
+	#	-H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+	#	"https://gitlab.com/api/v4/${ID_FRAGMENT}/search?size=100&scope=blobs&search=$(jq -Rr @uri <<< "${SEARCH_QUERY}")" \
+  #	| jq -c '.[]' \
+	#	> "$TMP/results.jsonl"
+
+	url="https://gitlab.com/api/v4/${ID_FRAGMENT}/search?per_page=$PER_PAGE&scope=blobs&search=$(jq -Rr @uri <<< "${SEARCH_QUERY}")"
+
+	hash="$(sha1sum <<< "$url" | awk '{ print $1 }')"
+	debug "Hash is $hash"
+
+	hypercurl "$url"
+
+	# add full path to project ids
+	debug "Post-Process #1 on $TMP/results.jsonl"
+	if [[ -n "$REGEX_INCLUDE" ]] || [[ -n "$REGEX_EXCLUDE" ]]; then
+		jq_filter=1
+	fi
+
+	if [[ "$jq_filter" -eq 1 ]] && [[ "$REGEX_FILTER_AROUND_MATCHES_ONLY" -eq 1 ]]; then
+		cat "$TMP/results.jsonl"	\
+			| jq --arg regex_include "$REGEX_INCLUDE" --arg regex_exclude "$REGEX_EXCLUDE" '
+					.data as $data
+					|if (($regex_include|length)>0) then select($data|test($regex_include;"i")) end
+					|if (($regex_exclude|length)>0) then select($data|test($regex_exclude;"i")|not) end' \
+			> "$TMP/.results.jsonl"
+		mv "$TMP/.results.jsonl" "$TMP/results.jsonl"
+	fi
+
+
+	# add full path to project ids
+	debug "Post-Process #2 on $TMP/results.jsonl"
+	resolve-project-ids-to-full-pathes "$TMP/results.jsonl" > "$TMP/.results.jsonl"
+	mv "$TMP/.results.jsonl" "$TMP/results.jsonl"
+
+
+	# sort, group, enrich by some fields
+	# - .tmpfile will be used if download is needed
+	# - .matches aggregates matched per project/file/ref
+	debug "Post-Process #3 on $TMP/results.jsonl"
+	jq --arg tmp "$TMP" --argjson linesbefore "$GLAB_LINES_BEFORE" --argjson linesafter "$GLAB_LINES_AFTER" -sc '
+		group_by(.project_id,.path,.ref)
+		|sort_by(.[0].full_path,.[0].path,.[0].ref)
+		|.[] as $g
+		|$g[0]
+		|{project_id,path,ref,project_path:.full_path}
+		|.file_url="https://gitlab.com/api/v4/projects/\(.project_id)/repository/files/\(.path|@uri)/raw?ref=\(.ref|@uri)"
+		# if linecount is smaller then 5 then matching line is probably the starting lines
+		# gitlab doesnt explicitly outline the matching line, it sucks so we "try" to make it less bad
+		|([.data // ""|scan("\n";"g")]|length) as $linecnt
+		|.matches=[
+			$g[]
+			|(if (($linesbefore+$linesafter+1) < $linecnt) then (.startline+$linesbefore) else (.startline-1) end) as $matchline
+			|{startline,matchline:$matchline,data}
+		]
+		|.tmpfile="\($tmp)/dl/\(.project_path)/-/\(.path)"  # +"@"+.ref
+	' "$TMP/results.jsonl" > "$TMP/.results.jsonl"
+	mv "$TMP/.results.jsonl" "$TMP/results.jsonl"
+
+
+	# download files if full results is wanted
+	if [[ "$FULL_RESULTS" -eq 1 ]]; then
+		debug "Downloading files for $TMP/files.curl"
+		mkfifo "$TMP/headers"
+		jq -r \
+			 '[
+			 	"url=\(.file_url)",
+			 	"output=\"\(.tmpfile|gsub("\"";"\\\""))\""
+			 ]
+			 |join("\n") + "\n\n"
+			 ' \
+			   "$TMP/results.jsonl" \
+			 > "$TMP/files.curl"
+		total_files="$(grep '^url' "$TMP/files.curl" | wc -l)"
+		filecount=0
+		(
+			while read -r line; do
+				if [[ "$line" =~ HTTP/[0-9\.]\ 200 ]]; then
+					let 'filecount+=1'
+					printf "\e[2K\r%s of %s full files retrieved"  "$filecount" "$total_files" >&2
+				fi
+				
+			done < "$TMP/headers" 
+		) &
+		curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" -D "$TMP/headers"   --create-dirs --parallel --config "$TMP/files.curl"
+		rm "$TMP/files.curl"
+		rm "$TMP/headers"
+		printf "\e[2K\r" >&2
+	fi
+
+	if [[ "$jq_filter" -eq 1 ]] && [[ "$REGEX_FILTER_AROUND_MATCHES_ONLY" -ne 1 ]]; then
+		# optimized for performance
+		while IFS=$'\t' read -r tmpfile json _; do
+			# we stay bash-native here and don't try to spawn other processes
+			if [[ ! -e "$tmpfile" ]]; then
+				raise-error "$tmpfile does not exist"	
+			fi
+			buffer="$(<"$tmpfile")"
+			printf "\e[2K\rFiltering %s (%d bytes)" "$tmpfile" "${#buffer}" >&2
+			printf "%s\1%s\n" "${buffer//$'\n'/$'\2'}" "$json" 
+		done < <(jq -r '[.tmpfile, @json]|join("\t")' "$TMP/results.jsonl" ) \
+			| jq -rR --arg d $'\1' --arg n $'\2' \
+				--arg regex_include "$REGEX_INCLUDE" --arg regex_exclude "$REGEX_EXCLUDE" \
+				--argjson lines_before "$LINES_BEFORE" --argjson lines_after "$LINES_AFTER" "${jq_filter_args[@]}" \
+				'
+				# we have two parts: file and json
+				split($d) as $input
+				|(try ($input[1]|fromjson)  catch ($input[1]|stderr|error("failed parsing json"))) as $json
+				|($input[0]|split($n)) as $lines
+				|$json
+				|(
+					# if negative regex is not fullfilled we empty the row via select
+					if (($regex_exclude|length)>0) then select(any($lines[]|test($regex_exclude;"i"))|not) end
+					# then for positive regex we populate $matches
+					|if (($regex_include|length)>0) then
+						(
+							reduce $lines[] as $l 
+							(
+								{l:0,m:[]};
+								.l+=1
+								|if ($l|test($regex_include;"i")) then 
+									.m+=[{
+											matchline:.l,
+											startline:((.l-$lines_before) as $v|if ($v<1) then 1 else $v end),
+											# data: ($lines[(.l-1-$lines_before):($lines_before+$lines_after)]|join("\n"))
+									}] 
+								end
+							)
+						).m as $matches
+						|select($matches|length>0)
+						|.matches+=$matches
+						|.matches=(.matches|sort_by(.startline))
+					end
+				)
+				# second part: JSON line
+				|.data=($lines|join("\n"))
+				' \
+			> "$TMP/.results.jsonl"
+			mv "$TMP/.results.jsonl" "$TMP/results.jsonl"
+			printf "\e[2K\r" >&2
+		fi	
+
+}
+
+
+# input jsonl
+function search_filter {
+	true
+}
+
+function highlight_filter {
+	while read -r project_id path ref highlight_line project_path tmpfile _; do
+		let 'highlight_line+=2'
+
+	done <  <(jq --arg tmp "$TMP" -cr '[.[]|{project_id,path,ref,startline,matchline,project_path,tmp}]|sort|unique[]|[.project_id,.path,.ref,.matchline,.project_path,]|@tsv' "$tmp/results.json")
+}
+
+function detect-language-by-ext {
+	# boilerplate for _create-detect-language-by-ext
+	# usage:
+	#  1. source /dev/stdin < <(_create-detect-language-by-ext)
+	#  2. detect-language-by-ext "sh"
+	true
+}
+
+function _create-detect-language-by-ext {
+	local IFS
+	IFS=$'\t'
+
+	cat <<- 'EOM'
+	function detect-language-by-ext {
+		local lang=""
+		case "${1?ext}" in
+	EOM
+	while read -r lang matches; do 
+		case="$(echo "$matches" | sed -r 's/(^|\t)([a-zA-Z]+)(\t|$)/\1*\.\2|\2\3/g; s/(^|\t)(\.)/\1*/g; s/ /\\ /g' | tr '\t' '|')"
+			printf "\t%s)\n\t\t lang=%q\n\t\t;;\n" "$case" "$lang"
+	done < <(bat --list-languages | tr ',:' $'\t')
+	cat <<- 'EOM'
+		esac
+		echo "$lang"
+	}
+	EOM
+}
+
+
+function highlight {
+	bat -n -H$highlight_line -r $startline:+$lines_num "$tmpfile"
+}
+
+
+
+function output {
+	# and output
+	case "$OUTPUT_FORMAT" in
+		tar)
+			mkdir "$TMP/archive"
+		  jq -s '[.[]|del(.tmp_file,.data)]' "$TMP/results.jsonl" > "$TMP/archive/results.json"
+		  while read -r tmpfile pp p _ ; do 
+					target="$TMP/archive/$pp/-/$p"
+					if [[ ! -d "${target%/*}" ]]; then
+						mkdir -p ${target%/*}
+					fi
+					echo "$tmpfile" "$target"  >&2
+			done < <(jq -r '[.tmpfile,.project_path,.path]|join("\t")' "$TMP/results.jsonl")
+
+			
+			tar -C "$TMP/dl" -c  .
+			;;
+		dir)
+			jq -s '[.[]|del(.tmp_file,.data)]' "$TMP/results.jsonl" > "$OUTPUT_DIRECTORY/results.json"
+			while read -r tmpfile pp p _ ; do 
+					target="$OUTPUT_DIRECTORY/$pp/-/$p"
+					if [[ ! -d "${target%/*}" ]]; then
+						mkdir -p ${target%/*}
+					fi
+					cp "$tmpfile" "$target"
+					printf "%s\n" "$target"
+			done < <(jq -r '[.tmpfile,.project_path,.path]|join("\t")' "$TMP/results.jsonl")
+			;;
+		full)
+			local c=0
+			while read -r tmpfile pp p _ ; do 
+					let 'c+=1'
+					printf "%s\n" "[$c] $pp/-/$p" >&2
+					cat "$tmpfile" 
+					printf "%s" $'\n\0' 
+			done < <(jq -r '[.tmpfile,.project_path,.path]|join("\t")' "$TMP/results.jsonl")
+			;;
+		*)
+			cat "$TMP/results.jsonl"
+			;;
+		esac
+}
+
+function output_format_filter {
+	local project_id
+	local path
+	local ref
+	local full_path
+	local tmp
+	local matches_json
+	local IFS
+	local location_info=""
+	local line_begin
+	IFS=$'\t'
+
+	case "$OUTPUT_FORMAT" in
+		path)
+			jq -r '"\(.project_path)/-/\(.path)"' | auniq
+			;;	
+		list)
+			jq -r '. as $r|.matches[]|"\($r.project_path)/-/\($r.path):\(.startline)"'
+			;;
+		projects)
+			jq -rs '[.[].project_path]|unique[]'
+			;;
+		jsonl|ndjson)
+			# if stdout is attached to terminal pretty print otherwise raw output
+			[[ -t 1 ]] && jq || cat
+			;;
+		json)
+			# if stdout is attached to terminal pretty print otherwise raw output
+			[[ -t 1 ]] && jq -s || jq -cs
+			;;
+		grep|rg)
+			function post-output {
+				if [[ "$OUTPUT_FORMAT" == "grep" ]]; then
+					awk -v f="$location_info" -v n="$line_begin" '{ print  f ":" n ":" $0; n=n+1}'
+					return
+				fi
+				cat 
+			}
+
+			function output-file {
+				if [[ "$FULL_RESULTS" -eq 1 ]]; then
+					cat "$tmpfile"
+				else	
+					# "" * -3 yields in ""
+					jq -r --argjson filllines "$((matchline-LINES_BEFORE))" '("\n" * ($filllines-1)) + .' <<< "$data" 
+				fi
+
+			}
+
+			match_cnt=0
+			file_cnt=0
+			while read -r project_id path ref project_path tmpfile first_matchline matches_json _; do
+				let 'file_cnt+=1'
+				#let 'highlight_line+=2'
+				#startline=$((highlight_line-LINES_BEFORE))
+				#startline=$((startline<0?0:startline))
+				
+				if is-color; then
+					href="https://gitlab.com/$project_path/-/blob/$ref/$path?ref_type=$ref#L$first_matchline"
+					location_info="$(printf "[%d] %s/-/%s\n" "$file_cnt" "$project_path" "$path")"
+					location_info="$(href $href $location_info)"
+					# #L37
+					
+				else
+					location_info="$(printf "[%d] %s/-/%s\n" "$file_cnt" "$project_path" "$path")"
+				fi
+
+
+				
+				# bat --list-languages
+				bat_args=()
+				if is-color; then
+					bat_args+=(--color=always)	
+				fi
+			   
+				 #*default*, full, auto, plain, changes, header,  header-filename,  header-filesize,  grid
+				 #--decorations never --style default
+				
+				if [[ "$OUTPUT_FORMAT" == "rg" ]]; then
+					printf "\n%s\n" "$location_info"
+					bat_args+=(--style=numbers) # only decorate with numbers
+				else
+					bat_args+=(--decorations=never) # line numbering will be left-hand done by awk
+				fi
+				code_fragments=0
+				
+
+				lang="$(detect-language-by-ext "${path##*.}" )"
+				if [[ -n "$lang" ]]; then
+					bat_args+=(--language "$lang")
+				fi
+				while read -u3 -r matchline data _; do
+					let 'match_cnt+=1'
+					line_begin=$((matchline-LINES_BEFORE))
+					line_begin=$((line_begin<0?0:line_begin))
+					line_end=$((matchline+LINES_AFTER))
+					let 'code_fragments+=1'
+
+					#F="$(output-file)"
+					#match="$(jq -R 'test("imagePullSecrets")' <<< "$F")"
+					#if [[ "$match" == "false" ]]; then
+				  #	break 1
+					#fi
+
+					if [[ "code_fragments" -ge 2 ]] && [[ "$OUTPUT_FORMAT" == "rg" ]]; then
+						printf "%s\n" "---"
+					fi
+					output-file | bat -H "$((matchline))" -r "$line_begin:$line_end" "${bat_args[@]}" \
+						| post-output
+
+					# | bat -H $startline
+					# jq -r <<< "$data" || echo "$startline"
+				done 3< <(jq -r '.[]|[.matchline, (.data|@json)]|join("\t")' <<< "$matches_json" )
+				#printf "%s" "$matches_json" | jq -r '
+			#		.[]
+			#		|("\n" * (.startline-2|tonumber)) + .data
+			#	' | bat -H 2 "${bat_args[@]}" | post-output
+			# TODO: JQ encoding failure? -› that's we sed
+			# [{"startline":141,"data":"    DOCKER_TLS_CERTDIR: \\"\\"\\n  script:\\n    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY\\n    - cloneRepo nielsen-media/maf/maf-public/DevOps-IL-WebInfra-Developer-Env.git $NMC_CI_REPO_BRANCH\\n    - docker-compose --version\\n"}]
+			done <  <(jq -cr --arg tmp "$TMP" '[.project_id,.path,.ref,.project_path,.tmpfile,(.matches[0].matchline),(.matches|@json)]|join("\t")' )
+
+			printf "\n\nTOTAL %d matches in %d files\n" "$match_cnt" "$file_cnt" >&2
+			;;
+		raw|tar|dir|full)
+			# jq -r '.matches[].data'
+			# jq -cr --arg tmp "$TMP"  '[.project_id,.path,.ref,.project_path,.tmpfile,(.matches|@json)]|@tsv'
+			cat
+			;;
+	esac
+}
+
+
+function post {
+		if  [[ "$OUTPUT_FORMAT" != "json"* ]]; then
+			lines_num=$(($LINES_BEFORE + $LINES_AFTER))
+
+				if [[ -n "$REGEX_INCLUDE" ]]; then
+					# unbuffer bat -n  $tmpfile | rg "$REGEX_INCLUDE" -B $LINES_BEFORE -A $LINES_AFTER
+					if [[ "$OUTPUT_FORMAT" == "grep" ]]; then
+						cat "$tmpfile" | rg "$REGEX_INCLUDE" -B $LINES_BEFORE -A $LINES_AFTER --color=always -n --no-column  | awk -v f="$project_path/-/$path" '{ print  f n ":" $0 }'
+					else
+						printf "\n"
+						#printf %"$COLUMNS"s | tr " " "-"
+						printf "$project_path/-/$path:$highlight_line @$ref \n" 
+						#printf %"$COLUMNS"s | tr " " "-"
+
+						cat "$tmpfile" | rg "$REGEX_INCLUDE" -B $LINES_BEFORE -A $LINES_AFTER -n
+					fi
+				else
+					# bat -n "$tmpfile" --theme "DarkNeon"
+					printf "\n"
+						#printf %"$COLUMNS"s | tr " " "-"
+					printf "$project_path/-/$path:$highlight_line @$ref \n" 
+					
+				fi	
+	else
+		case "$OUTPUT_FORMAT" in
+			grep|g)
+				jq -r '.[]|. as $r|(.startline as $s|(.data|split("\n")|to_entries)[] as $d|"\($r.project_path)/-/\($r.path):\($s+$d.key): \($d.value)")' "$TMP/results.json"
+				;;
+			ripgrep|rg)
+				jq -r '.[]|. as $r|("\($r.project_path)@\($r.path)",.startline as $s|(.data|split("\n")|to_entries)[] as $d|"\($s+$d.key): \($d.value)")' "$TMP/results.json"
+				;;
+			jsonl|ndjson) 
+				jq '.[]' "$TMP/results.json"
+				;;
+			json) 
+				jq '.' "$TMP/results.json"
+				;;
+			raw|tar|dir|full)
+				cat
+				;;
+		esac	
+	fi
+}
+
+function main() {	
+	trap  shutdown INT EXIT QUIT
+
+	TMP="$(mktemp -d)"
+	debug "Temp directory is $TMP. Not cleaning up!" 
+	init-args "$@"
+	source /dev/stdin < <(_create-detect-language-by-ext)	
+	request
+	output | output_format_filter
+}
+
+main "$@"
+
+
+
+	
