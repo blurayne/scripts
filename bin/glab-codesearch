@@ -982,7 +982,7 @@ function output_format_filter {
 			#		|("\n" * (.startline-2|tonumber)) + .data
 			#	' | bat -H 2 "${bat_args[@]}" | post-output
 			# TODO: JQ encoding failure? -› that's we sed
-			# [{"startline":141,"data":"    DOCKER_TLS_CERTDIR: \\"\\"\\n  script:\\n    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY\\n    - cloneRepo nielsen-media/maf/maf-public/DevOps-IL-WebInfra-Developer-Env.git $NMC_CI_REPO_BRANCH\\n    - docker-compose --version\\n"}]
+			# [{"startline":141,"data":"    DOCKER_TLS_CERTDIR: \\"\\"\\n  script:\\n    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY\\n
 			done <  <(jq -cr --arg tmp "$TMP" '[.project_id,.path,.ref,.project_path,.tmpfile,(.matches[0].matchline),(.matches|@json)]|join("\t")' )
 
 			printf "\n\nTOTAL %d matches in %d files\n" "$match_cnt" "$file_cnt" >&2
