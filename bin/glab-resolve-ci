@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 
-# glab-resolve-ci nielsen-media/identity/webapps/web-nmt-backend
-# glab-resolve-ci https://gitlab.com/nielsen-media/identity/webapps/web-nmt-backend/-/jobs/6921067666 
-# glab-resolve-ci https://gitlab.com/nielsen-media/identity/webapps/web-nmt-backend/-/pipelines/1345283642
+##
+# Gitlab Resolve CI Info
+#
+# @license GPLv3 (https://www.gnu.org/licenses/gpl-3.0.en.html)
+# @author Markus Geiger <mg@evolution515.net>
+
+
+# glab-resolve-ci myorg/mygroup/mysubgroup/myproject
+# glab-resolve-ci https://gitlab.com/myorg/mygroup/mysubgroup/myproject/-/jobs/6921067666 
+# glab-resolve-ci https://gitlab.com/myorg/mygroup/mysubgroup/myproject/-/pipelines/1345283642
+
 set -euo pipefail
 
 export GITLAB_TOKEN="$GITLAB_TOKEN"
@@ -132,9 +140,7 @@ function main {
 	local pipeline_definition_json=""
 	local is_protected_branch=0
 	check-token
-	# set -- "https://gitlab.com/nielsen-media/identity/webapps/web-nmt-backend/-/jobs/6970154188" 
-	# set -- nielsen-media/identity/cloudops/continuous-integration
-	# job_json=$(echo "https://gitlab.com/nielsen-media/identity/webapps/web-nmt-backend/-/jobs/6970154188"  | jq -R 'capture("https://(?<gitlab_host>[^/]+)/(?<project_path>.+)/-/(jobs/(?<job_id>\\d+))?")' | tee /dev/tty )""
+	# job_json=$(echo "https://gitlab.com/myorg/mygroup/mysubgroup/myproject/-/jobs/6970154188"  | jq -R 'capture("https://(?<gitlab_host>[^/]+)/(?<project_path>.+)/-/(jobs/(?<job_id>\\d+))?")' | tee /dev/tty )""
 	job_json="$(echo "$@" | jq -R 'capture("https://(?<gitlab_host>[^/]+)/(?<project_path>.+)/-/(jobs/(?<job_id>\\d+))?")')"
 	if [[ -n "$job_json" ]]; then
 		project_path="$(jq -r .project_path <<< "$job_json")"
