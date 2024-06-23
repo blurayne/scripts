@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+
+# glab-resolve-ci nielsen-media/identity/webapps/web-nmt-backend
+# glab-resolve-ci https://gitlab.com/nielsen-media/identity/webapps/web-nmt-backend/-/jobs/6921067666 
+# glab-resolve-ci https://gitlab.com/nielsen-media/identity/webapps/web-nmt-backend/-/pipelines/1345283642
+set -euo pipefail
+
+export GITLAB_TOKEN="$GITLAB_TOKEN"
+
+BASENAME="${0##*/}"
+DEBUG=0
+COLORIZE=-1
+
+function is-color {
+	if  [[ "$COLORIZE" -eq 1 ]] || ( [[ "$COLORIZE" -eq -1 ]] && [[ -t 1 ]] ); then
+		COLORIZE=1
+		return 0
+	fi
+	return 1
+}
+
+
+function debug {
+  if [[ "$DEBUG" -eq 0 ]]; then
+ 		return
+  fi
+  local tmpl="%s\n"
+  if is-color; then
+			tmpl="\e[1m\e[31m\e[38;2;255;0;255m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${*?message}" >&2
+
+}
+
+function err {
+	local tmpl="%s\n"
+	if is-color; then
+			tmpl="\e[1m\e[31m\e[38;2;196;0;32m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+function warn {
+	local tmpl="%s\n"
+	if is-color; then
+			tmpl="\e[3m\x1b[38;2;255;100;0m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+function info {
+	local tmpl="%s\n"
+	if is-color; then
+			tmpl="\e[1m\e[35m\x1b[38;2;255;192;64m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+function label {
+    local len="${2:-1}"
+  	local tmpl="%-${len}s"
+		if is-color; then
+				tmpl="\e[37m\e[1m\x1b[38;2;255;255;255m%-${len}s\x1b[0m"
+  	fi
+  	printf "$tmpl" "${1?label}" >&2
+}
+
+function notice {
+	local tmpl="%s\n"
+	if is-color; then
+			tmpl="\e[37m\x1b[38;2;128;128;164m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+function href {
+	local href="${1}"
+	local text="${2:-$1}"
+	if is-color; then
+			printf "\e]8;;%s\a%s\e]8;;\a" "$href" "$text" 
+			return
+  fi
+	printf "%s" "$text" 
+}
+
+
+function raise-error() {
+	local message="${1?error-message}"
+	local exit_code="${2:-1}"
+	err "$BASENAME: $message"
+	exit "$exit_code"
+}
+
+function check-token {
+	curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/user" 1>/dev/null
+}
+
+function get-namespace-info {
+	local namespace="${1?namespace}"
+	# first call is to check if token is valid
+	 (curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/groups/$(jq -Rr @uri <<< "$namespace")/" 2>/dev/null | jq --arg ns "$namespace" '{id, name, path: $ns, description, type:"group"}')  \
+		|| (curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$(jq -Rr @uri <<< "$namespace")/" 2>/dev/null | jq --arg ns "$namespace"  '{id, name, path: $ns, description, type:"project"}') \
+		|| raise-error "Namespace ${namespace} could not be found!"
+}
+
+
+function resolve-gitlab-path {
+	local project_path="${1?project-path}"
+	local last_path
+	printf "Traversing parent groups…" >&2
+	(
+		while :; do
+			json="$(get-namespace-info "$project_path")"
+			last_path="$project_path"
+			project_path="${project_path%/*}"
+			jq -c . <<< "$json"
+			if [[ "$project_path" == "$last_path" ]]; then
+				break
+			fi			
+		done
+	) | jq -cs 
+	printf "\e[2K\r" >&2
+}
+
+function main {
+	local project_path=""
+	local job_id=""
+	local job_name=""
+	local pipeline_ref=""
+	local pipeline_commit=""
+	local job_json=""
+	local pipeline_definition_json=""
+	local is_protected_branch=0
+	check-token
+	# set -- "https://gitlab.com/nielsen-media/identity/webapps/web-nmt-backend/-/jobs/6970154188" 
+	# set -- nielsen-media/identity/cloudops/continuous-integration
+	# job_json=$(echo "https://gitlab.com/nielsen-media/identity/webapps/web-nmt-backend/-/jobs/6970154188"  | jq -R 'capture("https://(?<gitlab_host>[^/]+)/(?<project_path>.+)/-/(jobs/(?<job_id>\\d+))?")' | tee /dev/tty )""
+	job_json="$(echo "$@" | jq -R 'capture("https://(?<gitlab_host>[^/]+)/(?<project_path>.+)/-/(jobs/(?<job_id>\\d+))?")')"
+	if [[ -n "$job_json" ]]; then
+		project_path="$(jq -r .project_path <<< "$job_json")"
+		job_id="$(jq -r .job_id <<< "$job_json")"
+	fi
+
+	if [[ -z "$project_path" ]]; then
+		project_path="$1"
+	fi
+	# if manually specified
+	project_path="${project_path#/}"  # prefix
+	project_path="${project_path%/}"  # suffix
+
+	if [[ -z "$project_path" ]]; then
+		echo "project path is required" >&2
+		exit 1
+	fi
+
+	printf "Resolving %s…" "$project_path" >&2
+	project_json="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$(jq -Rr @uri <<< "$project_path")" | jq)"	
+	project_path="$(jq -r .path_with_namespace <<< "$project_json")"
+	project_id="$(jq -r .id <<< "$project_json")"
+
+	if [[ -n "$job_id" ]]; then
+		job_json="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/${project_id}/jobs/${job_id}" | jq)"
+		# "failure_reason": "script_failure",
+		# artifacts
+	fi
+	if [[ -n "$job_json" ]]; then
+		pipeline_id="$(jq -r .pipeline.id <<< "$job_json")"
+		job_name="$(jq -r .name <<< "$job_json")"
+		pipeline_ref="$(jq -r .ref <<< "$job_json")"
+		pipeline_commit="$(jq -r .commit.id <<< "$job_json")"
+		is_protected_branch="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$project_id/protected_branches" | jq -r --arg pipeline_ref "$pipeline_ref" '[.[].name]|if any(.==$pipeline_ref) then "1" else "0" end')"
+	fi
+	
+
+	printf "\e[2K\rGot project_id=%d for %s\n" "$project_id" "$project_path" >&2
+
+	while IFS='' read -r json_item _; do
+		type="$(jq -r .type <<< "$json_item")"
+		path="$(jq -r .path <<< "$json_item")"
+		name="$(jq -r .name <<< "$json_item")"
+		description="$(jq -r .description <<< "$json_item")"
+		info ""
+		info "$(printf "Variables of %s (%s-level) – %s %s "  "$path" "$type" "$name" "$description")"
+		json_vars="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/${type}s/$(jq -Rr @uri <<< "$path")/variables" | jq -c || true)"
+		if [[ -z "$json_vars" ]]; then
+			echo "No access (use pipeline to expose vars!)"
+		else
+			# TODO proteced path?
+			jq -r  --argjson is_protected_branch "$([[ "$is_protected_branch" -eq 1 ]] && printf "true" || printf "false")" '
+				[
+					.[]
+					|select(.variable_type?=="env_var")
+					|((.protected) and ($is_protected_branch|not)) as $do_comment
+					|"\(if $do_comment then "# " else "" end)\(.key)=\(.value|@sh) \(if .protected then "; : protected" else "" end)"
+				]|sort[]' <<< "$json_vars"  | bat -l bash --decorations=never 
+		    #TODO "environment_scope": "npd-blue-ue1",
+		fi
+	done < <(resolve-gitlab-path "$project_path" | jq -c 'reverse[]' )
+
+
+	info ""
+
+	if [[ -n "$pipeline_ref" ]]; then
+		printf "\e[2K\rGetting Pipeline Definition" >&2
+		# dry_run_ref dry_run=true will include includes: 
+		pipeline_ci_json="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/${project_id}/ci/lint?dry_run=false&content_ref=$pipeline_commit" | jq)"
+		pipeline_definition_json="$(jq -r .merged_yaml <<< "$pipeline_ci_json"| dasel -r yaml -w json)"
+		printf "\e[2K\r" >&2
+	fi
+
+	if [[ -n "$pipeline_definition_json" ]]; then
+		
+		
+		info "Pipeline Default Variables (defined in .gitlab-ci.yaml)"
+		echo $pipeline_definition_json  | jq -r '
+			[
+				.variables?
+				|to_entries[]
+				|(if (.value|scalars // false) then .value else (.value.value) end) as $value
+				|"\(.key)=\($value|@sh)"
+			]|sort[]' | bat -l bash --decorations=never || true
+
+		info ""
+		info "Pipeline Run Variables (user-choice)"
+		printf "\e[2K\rGetting Pipeline vars" >&2
+		pipeline_vars_json="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/${project_id}/pipelines/${pipeline_id}/variables" | jq)"
+		printf "\e[2K\r" >&2
+		echo $pipeline_vars_json  | jq -r '
+			[
+				.[]
+				|select(.variable_type=="env_var")
+				|"\(.key)=\(.value|@sh)"
+			]|sort[]' | bat -l bash --decorations=never || true
+
+
+		echo >&2
+		info "Pipeline"
+		
+
+ 		jq '{
+ 				includes: [
+            		.includes?
+            		|group_by(.context_project,.extra.project,.type)[]
+            		|.[0] as $first
+            		|
+            			{type:$first.type}
+            			* $first.extra
+            			* { included_from: ($first.context_project // ""), files: ([.[].raw]|sort|unique) }
+            	]
+            }
+         '  <<< "$pipeline_ci_json" | dasel -r json -w yaml | bat -l yaml --decorations=never	
+		jq '{workflow,defaults}' <<< "$pipeline_definition_json" | dasel -r json -w yaml | bat -l yaml --decorations=never
+
+		echo >&2
+		info "Job Definition"
+ 		jq --arg job_name "$job_name" '{$job_name: .[$job_name]}' <<< "$pipeline_definition_json" | dasel -r json -w yaml | bat -l yaml --decorations=never
+ 	fi
+
+
+ 	echo >&2
+
+	clone_url_ssh="$(jq -r .ssh_url_to_repo <<< "$project_json")"
+	project_url="$(jq -r .web_url <<< "$project_json")"
+	project_name="$(jq -r .name <<< "$project_json")"
+	url="$project_url/-/tree/$pipeline_ref"
+	
+
+	info "$project_name (project_id=$project_id)"
+	echo >&2
+	if [[ -n "$pipeline_commit" ]]; then
+		printf "%s\n" "$(href "$url" "$url")"
+		printf "%s\n" "---"
+		printf "# if serverside has uploadpack.allowReachableSHA1InWant=1 (gitlab.com has not)\n"
+		printf "git clone -b %s %s\n" "$pipeline_commit" "$clone_url_ssh" .
+		printf "# otherwise\n"
+		printf "git init\n"
+		printf "git remote add origin %s" "$clone_url_ssh"
+		printf "git checkout %s\n" "$pipeline_commit"
+		printf "%s\n" "---"
+		printf "%s/%s" "$pipeline_ref" "$pipeline_commit"
+		printf "%s\n" "---"
+		tmp="$(mktemp -u)"
+		jq . <<< "$pipeline_definition_json" | dasel -r json -w yaml | bat -l yaml --decorations=never > "$tmp.yaml"
+		echo "Complete pipeline: bat -u --color=always $tmp.yaml | less -R"
+		echo "Complete pipeline: helix $tmp.yaml"
+		echo "Complete pipeline: subl $tmp.yaml"
+		echo "Complete pipeline: zed $tmp.yaml"
+
+		echo >&2
+		if [[ "$is_protected_branch" -eq 1 ]]; then
+			warn "You are on a protected branch!"
+		else
+			notice "This is NO protected branch!"
+		fi
+
+		printf "Downloading files" >&2
+		TMP="$(mktemp -d)"
+		jq -r --arg tmp "$TMP" '
+	        .includes[]
+	        |(.raw|capture("http(s)?://(?<host>[^/]+)/(?<ns>.+)/-/(raw/(?<ref>[^/]+)/)?(?<path>.+)")) as $p
+	        |"https://\($p.host)/api/v4/projects/\($p.ns|@uri)/repository/files/\($p.path|@uri)/raw?ref=\($p.ref)" as $api_url
+	        |"\($tmp)/\($p.host)/\($p.ns)/-/\($p.path)" as $file
+	        |"url=\($api_url)\noutput=\($file)\n"' <<< "$pipeline_ci_json"  \
+	        > "$TMP/curl.txt"
+	    curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" --parallel --create-dirs --config "$TMP/curl.txt"
+	    printf "\e[2K\r" >&2
+	    echo "Rest of pipeline files: $TMP"
+  fi
+}
+
+main "$@"
