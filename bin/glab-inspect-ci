@@ -6,7 +6,6 @@
 # @license GPLv3 (https://www.gnu.org/licenses/gpl-3.0.en.html)
 # @author Markus Geiger <mg@evolution515.net>
 
-
 # glab-resolve-ci myorg/mygroup/mysubgroup/myproject
 # glab-resolve-ci https://gitlab.com/myorg/mygroup/mysubgroup/myproject/-/jobs/6921067666 
 # glab-resolve-ci https://gitlab.com/myorg/mygroup/mysubgroup/myproject/-/pipelines/1345283642
@@ -215,8 +214,7 @@ function main {
 	fi
 
 	if [[ -n "$pipeline_definition_json" ]]; then
-		
-		
+
 		info "Pipeline Default Variables (defined in .gitlab-ci.yaml)"
 		echo $pipeline_definition_json  | jq -r '
 			[
@@ -225,6 +223,9 @@ function main {
 				|(if (.value|scalars // false) then .value else (.value.value) end) as $value
 				|"\(.key)=\($value|@sh)"
 			]|sort[]' | bat -l bash --decorations=never || true
+
+		info "Default image"
+		jq -r '.default.image' pipeline_definition_json <<< "$pipeline_definition_json" 2>/dev/null || echo '(default)'
 
 		info ""
 		info "Pipeline Run Variables (user-choice)"
