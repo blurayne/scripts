@@ -4,6 +4,8 @@
 
 ### `bin/glab-codesearch`
 
+> Gitlab Code Search spiced up for shell with syntax highlighting (using bat) and Regex Search (oniguruma)
+
 What can it do better than web-based Gitlab Codesearch?
 
 - Added Regular expressions
@@ -11,7 +13,7 @@ What can it do better than web-based Gitlab Codesearch?
 - Download full files
   - automatic, never or forced
   - save those files to a local directory (for further processing)
-  - our output as tarball 
+  - or output as tarball 
 - Different output formats
   - Just list projects involved
   - Just list all files involved

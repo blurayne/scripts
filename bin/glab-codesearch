@@ -7,7 +7,7 @@ set -eEuo pipefail
 #
 # @license GPLv3 (https://www.gnu.org/licenses/gpl-3.0.en.html)
 # @author Markus Geiger <mg@evolution515.net>
-
+# @author Markus Geiger <markus.geiger@nielsen.com>
 
 GITLAB_TOKEN="${GITLAB_TOKEN:-}"
 LINES_BEFORE=2
