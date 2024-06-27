@@ -63,21 +63,13 @@ function if-debug {
 	[[ "$DEBUG" -ne 0 ]]
 }
 
-function is-color {
-	if  [[ "$COLORIZE" -eq 1 ]] || ( [[ "$COLORIZE" -eq -1 ]] && [[ -t 1 ]] ); then
-		COLORIZE=1
-		return 0
-	fi
-	return 1
-}
-
 
 function debug {
   if [[ "$DEBUG" -eq 0 ]]; then
  		return
   fi
   local tmpl="%s\n"
-  if is-color; then
+  if [[ "$COLORIZE" -eq 1 ]]; then
 			tmpl="\e[1m\e[31m\e[38;2;255;0;255m%s\x1b[0m\n"
   fi
   printf "$tmpl" "${*?message}" >&2
@@ -86,15 +78,15 @@ function debug {
 
 function err {
 	local tmpl="%s\n"
-	if is-color; then
-			tmpl="\e[1m\e[31m\e[38;2;196;0;32m%s\x1b[0m\n"
+	if [[ "$COLORIZE" -eq 1 ]]; then
+			tmpl="\e[1m\e[31m\e[38;2;212;64;64m%s\x1b[0m\n"
   fi
   printf "$tmpl" "${1?message}" >&2
 }
 
 function warn {
 	local tmpl="%s\n"
-	if is-color; then
+	if [[ "$COLORIZE" -eq 1 ]]; then
 			tmpl="\e[3m\x1b[38;2;255;100;0m%s\x1b[0m\n"
   fi
   printf "$tmpl" "${1?message}" >&2
@@ -102,7 +94,7 @@ function warn {
 
 function info {
 	local tmpl="%s\n"
-	if is-color; then
+	if [[ "$COLORIZE" -eq 1 ]]; then
 			tmpl="\e[1m\e[35m\x1b[38;2;255;192;64m%s\x1b[0m\n"
   fi
   printf "$tmpl" "${1?message}" >&2
@@ -111,7 +103,7 @@ function info {
 function label {
     local len="${2:-1}"
   	local tmpl="%-${len}s"
-		if is-color; then
+		if [[ "$COLORIZE" -eq 1 ]]; then
 				tmpl="\e[37m\e[1m\x1b[38;2;255;255;255m%-${len}s\x1b[0m"
   	fi
   	printf "$tmpl" "${1?label}" >&2
@@ -119,7 +111,7 @@ function label {
 
 function notice {
 	local tmpl="%s\n"
-	if is-color; then
+	if [[ "$COLORIZE" -eq 1 ]]; then
 			tmpl="\e[37m\x1b[38;2;128;128;164m%s\x1b[0m\n"
   fi
   printf "$tmpl" "${1?message}" >&2
@@ -128,7 +120,7 @@ function notice {
 function href {
 	local href="${1}"
 	local text="${2:-$1}"
-	if is-color; then
+	if [[ "$COLORIZE" -eq 1 ]]; then
 			printf "\e]8;;%s\a%s\e]8;;\a" "$href" "$text" 
 			return
   fi
@@ -303,31 +295,33 @@ function usage {
 		  -f|--format <format>               Specify output format (choose from below)
 
 		  -j|--json                          JSON Output
-		  --jsonl                            JSONL Output
+		  --jsonl|--ndjson                   JSONL/NDJSON Output 
 		  --files                            Only output list of matched files 
 		  --projects                         Only output list of matched projects
 		  --matches                          Only output list of matched files and line numbers
 		  --grep                             Grep Output (Default)
-		  --rg--rg|--ack|--ag                Ack-like Output format (like Ripgrep Default)
-		  --ack                              Long Output format (like Ripgrep Default)
+		  --rg|--ack|--ag                    ack|ripgrep-like Output format
 		  --tar                              Output a tarball containing all the files and a results.jsonl
 		                                     (will imply to download all files)
 		  --full                             Output filenames on stderr and full file contents on stdout
-		                                     (so can do a qucik 'nmc-codesearch --full nmcapps_docker_host_load | grep DOCKER_HOST')
+		                                     (so can do a quick 'nmc-codesearch --full nmcapps_docker_host_load | grep DOCKER_HOST')
+          --dir=<directory>                  Output all files to a directory 
+
+
 
 		  -c|--color                         Enforce color
 		  -C|--no-color                      Disable color
 
 		                                     Colorization is done automatically
-		  -H|--highlight <regex>             Highlight by regex
+		  
+		  -h|--help)	                     Help
 
-		  -h|--help)	                       Help
 
-
-		PLANNED TO IMPLEMENT 
+		PLANNED TO BE IMPLEMENTED
 
 		  -x|--exclude-namespaces            Exclude projects or groups (seperated by comma, understands glob or regex)
 		  -X|--exclude-files                 Exclude files (seperated by comma, understands glob or regex)	
+		  hl:<regex>                         Highlight by regex
 
 		
 		QUERY MODIFIERS 
@@ -347,9 +341,9 @@ function usage {
 		  \   Escape Char     \*md
 
 		
-		QUERY SYNTAX (code search)
+		QUERY SYNTAX (Regular Gitlab Code Search)
 
-				 <QUERY>            Search in code             DOCKER_HOST
+		  <QUERY>            Search in code             DOCKER_HOST
 
 		  filename:, fn:     Filename                   filename:*spec.rb
 		  path:              Repository location        path:spec/workers/
@@ -359,17 +353,17 @@ function usage {
 
                             'extension:' and 'blob:' do return exact matches only!
 
+		ADDITIONAL QUERY SYNTAX 
 
-		QUERY SYNTAX (code search)
+		  This is not implemented by Gitlab API bit this script here.
 
-		  Regex can only be specified if you used a regular search sytnax before.
+		  Regex can only be specified if you used a regular search syntax before!
 
 		  rg:                Regex                      rg:project:\s.+templates
 		  not:               Regex (inverse)            rg:project:\s.+templates 
 
-
-		  Regex is not implemented by Gitlab API and requires to download regularly matching files before,
-		  except your specify -r flag
+		  Regex requires to download regularly matching files before, except 
+		  your specify the '-r' flag!
 
 
 		QUERY EXAMPLES
@@ -395,10 +389,10 @@ function usage {
 }
 
 function set-output-dir {
-	local directory="${1?directory}"
-	directory="${directory%/}"
-	if [[ ! -d "$directory" ]]; then
-			raise-error "$(readlink -f "$directory") does not exist!"
+	local dir="${1?directory}"
+	directory="${dir%/}"
+	if [[ ! -d "$dir" ]] || ! readlink -f "$directory" &>/dev/null; then
+		raise-error "directory '$dir' does not exist!"
 	fi
 	OUTPUT_DIRECTORY="$(readlink -f "$directory")"
 }
@@ -409,6 +403,12 @@ function init-args {
 	local resolve_path=""
 	local regex_include=()
 	local regex_exclude=()
+
+	# initialize for use inside subprocess
+	# we need to initialize COLORIZE while we are attached to main process stdout (terminal)
+	if  ( [[ "$COLORIZE" -eq -1 ]] && [[ -t 1 ]] ); then
+		COLORIZE=1
+	fi
 
 	if [[ $# -eq 0 ]]; then
 		usage
@@ -502,25 +502,20 @@ function init-args {
 				OUTPUT_FORMAT='json'
 				;;
 
-			--grep|--list|--json|--jsonl|--hits|--grep|--rg|--ndjson|--full|--matches|--projects|--files)
+			--grep|--list|--json|--jsonl|--hits|--grep|--rg|--ndjson|--full|--matches|--projects|--files|--tar|--ack|--ag|--dir=*)
 				OUTPUT_FORMAT="${arg#--}"
 				;;
 
-			--dir)
-				opt="${1?directory}"
-				shift 1
-				set-output-dir "$opt"
-				OUTPUT_FORMAT="${arg#--}"
-				;;
-
-			--tar)
-				OUTPUT_FORMAT="tar"
-				;;
 			-v|--version)
 				echo "$BASENAME, v$VERSION"
 				exit 0
 				;;
 
+			-?)
+				raise-error "unknown option: $arg"
+				;;
+
+			# if multiple single options were specified unwrap them
 			-[a-zA-Z]*)
 				set -- $(for ((i=1; i<${#arg}; i++ )); do echo " -${arg:$i:1}"; done) "$@"
 				;;
@@ -547,13 +542,27 @@ function init-args {
 				check-regex "$arg"
 				regex_exclude+=("${arg}")
 				;;
+			--*)
+				raise-error "unknown option: $arg"
+				;;
+
 
 			*) 
 				SEARCH_QUERY="${SEARCH_QUERY}${SEARCH_QUERY:+ }${arg}"
 				;;
 		esac
 	done
-	
+
+	if [[ "$OUTPUT_FORMAT" == "dir="* ]]; then
+		opt="${OUTPUT_FORMAT#*=}"
+		set-output-dir "$opt"
+		OUTPUT_FORMAT="dir"
+	fi
+	OUTPUT_FORMAT="${OUTPUT_FORMAT/ndjson/jsonl}"
+	OUTPUT_FORMAT="${OUTPUT_FORMAT/hits/matches}"
+	OUTPUT_FORMAT="${OUTPUT_FORMAT/list/files}"
+	OUTPUT_FORMAT="${OUTPUT_FORMAT/ack/rg}"
+	OUTPUT_FORMAT="${OUTPUT_FORMAT/ag/rg}"
 	if [[ "$OUTPUT_FORMAT" =~ ^(tar|dir|full)$ ]]; then
 			# download all files with tar
 			FULL_RESULTS=1
@@ -864,6 +873,11 @@ function output {
 		esac
 }
 
+# bash var to json bool
+function json_bool {
+	[[ "${1?bash-var}" -eq 1 ]] && printf true || printf false
+}
+
 function output_format_filter {
 	local project_id
 	local path
@@ -880,8 +894,25 @@ function output_format_filter {
 		path)
 			jq -r '"\(.project_path)/-/\(.path)"' | auniq
 			;;	
-		list)
+		matches)
 			jq -r '. as $r|.matches[]|"\($r.project_path)/-/\($r.path):\(.startline)"'
+			;;
+
+		files)
+			jq -r --argjson is_color "$(json_bool "$COLORIZE")" '
+				def ansi_href($title;$url):
+					"\u001b\u005d\u0038\u003b\u003b\($url)\u0007\($title)\u001b\u005d\u0038\u003b\u003b\u0007";
+
+				"[\(input_line_number)] \(.project_path)/-/\(.path)" as $title
+				|if ($is_color) then
+					# "https://gitlab.com/api/v4/projects/\(.project_id)/repository/files/\(.path|@uri)/raw?ref=\(.ref|@uri)" as $api_url
+					# "https://gitlab.com/\(.project_path)/-/raw/\(.ref|@uri)/\(.path)" as $raw_url
+					"https://gitlab.com/\(.project_path)/-/blob/\(.ref|@uri)/\(.path)" as $web_url
+					|ansi_href($title;$web_url)
+				else
+					$title
+				end
+			'
 			;;
 		projects)
 			jq -rs '[.[].project_path]|unique[]'
@@ -921,7 +952,7 @@ function output_format_filter {
 				#startline=$((highlight_line-LINES_BEFORE))
 				#startline=$((startline<0?0:startline))
 				
-				if is-color; then
+				if [[ "$COLORIZE" -eq 1 ]]; then
 					href="https://gitlab.com/$project_path/-/blob/$ref/$path?ref_type=$ref#L$first_matchline"
 					location_info="$(printf "[%d] %s/-/%s\n" "$file_cnt" "$project_path" "$path")"
 					location_info="$(href $href $location_info)"
@@ -935,8 +966,10 @@ function output_format_filter {
 				
 				# bat --list-languages
 				bat_args=()
-				if is-color; then
-					bat_args+=(--color=always)	
+				if [[ "$COLORIZE" -eq 1 ]]; then
+					bat_args+=(--color=always)
+				elif [[ "$COLORIZE" -eq 0 ]]; then
+					bat_args+=(--color=never)
 				fi
 			   
 				 #*default*, full, auto, plain, changes, header,  header-filename,  header-filesize,  grid
@@ -945,9 +978,11 @@ function output_format_filter {
 				if [[ "$OUTPUT_FORMAT" == "rg" ]]; then
 					printf "\n%s\n" "$location_info"
 					bat_args+=(--style=numbers) # only decorate with numbers
-				else
-					bat_args+=(--decorations=never) # line numbering will be left-hand done by awk
+				#else
+					# bat_args+=(--decorations=never) # line numbering will be left-hand done by awk
 				fi
+
+
 				code_fragments=0
 				
 
@@ -961,17 +996,11 @@ function output_format_filter {
 					line_begin=$((line_begin<0?0:line_begin))
 					line_end=$((matchline+LINES_AFTER))
 					let 'code_fragments+=1'
-
-					#F="$(output-file)"
-					#match="$(jq -R 'test("imagePullSecrets")' <<< "$F")"
-					#if [[ "$match" == "false" ]]; then
-				  #	break 1
-					#fi
-
 					if [[ "code_fragments" -ge 2 ]] && [[ "$OUTPUT_FORMAT" == "rg" ]]; then
 						printf "%s\n" "---"
 					fi
-					output-file | bat -H "$((matchline))" -r "$line_begin:$line_end" "${bat_args[@]}" \
+					output-file \
+						| bat -H "$((matchline))" -r "$line_begin:$line_end" "${bat_args[@]}" \
 						| post-output
 
 					# | bat -H $startline
@@ -1051,8 +1080,5 @@ function main() {
 	output | output_format_filter
 }
 
+
 main "$@"
-
-
-
-	

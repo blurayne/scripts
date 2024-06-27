@@ -42,7 +42,7 @@ Note: `gitlab-runner exec` command was [removed in v17.0 #385235](https://gitlab
 But they have another epic dealing with [local pipeline execution #2797](https://gitlab.com/gitlab-org/gitlab-runner/-/issues/2797) ([blueprint](https://gitlab.com/gitlab-org/gitlab/-/blob/ci-local-pipeline-exeuction/doc/architecture/blueprints/ci_local_pipeline_execution/ci_local_pipeline_execution.md)) 
 *(but I don't agree uploading artifacts won't be possible since `gitlab-runner-local-oci-exec` exactly did that!)*
 
-### ` bin/gitlab-pipeline`
+### `bin/gitlab-pipeline`
 
 Meanwhile superseded by https://gitlab.com/gitlab-org/cli/-/tree/main/docs/source/ci
 
