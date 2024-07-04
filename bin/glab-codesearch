@@ -31,6 +31,49 @@ COLORIZE=-1
 PER_PAGE=100 # 100 is gilab's max page size
 VERSION="0.1"
 
+
+##
+# compare one version against another
+# param1: version 1
+# param2: operater (like used by test)
+# param3: version 2
+function vercomp {
+    local IFS=.
+    local a=($1) op="$2" b=($3)
+    test $(printf "%d%03d%03d%03d" "${a[@]}") "$op" $(printf "%d%03d%03d%03d" "${b[@]}")
+}
+
+## 
+# param1: which binary
+# param2: option or rest of command to get version
+# param3: operator
+# param4: required version
+function req-bin {
+	local bin="$1"
+	# hash will output error message of not found
+	if ! hash &>/dev/null "$bin"; then
+		warn "no binary for '$bin' not found"
+		return 1
+	fi
+	if [[ "${2:-}" ]]; then
+        local binverargs="${2?version-argument}"
+        local vercomp="${3?comparision-test}"
+        local reqversion="${4?test-against-version}"
+        local regex="${5:-(([0-9]+)(\.[0-9]+)?(.[0_9]+)?)}"
+        local usematch="${6:-1}"
+        if ! [[ "$(eval "$bin" "$binverargs")" =~ $regex ]]; then
+        	warn "could not get version string for $(command -v "$bin")"
+        fi
+		local binversion="${BASH_REMATCH[$usematch]}"
+        if vercomp $binversion $vercomp $reqversion; then
+            return 0
+        fi
+        warn "version comparsion did not match: $(command -v "$bin"): version is $binversion but required is $vercomp $reqversion"
+        return 1
+    fi
+}
+
+
 function shutdown {
 	if [[ "$DEBUG" -ne 1 ]] && [[ -d "$TMP" ]]; then
 		rm -fr "$TMP"
@@ -795,32 +838,38 @@ function highlight_filter {
 	done <  <(jq --arg tmp "$TMP" -cr '[.[]|{project_id,path,ref,startline,matchline,project_path,tmp}]|sort|unique[]|[.project_id,.path,.ref,.matchline,.project_path,]|@tsv' "$tmp/results.json")
 }
 
+##
+# Detect languge for bat by extensions
+# param1: file extension
+# stdout: param used for bat --lang
+#
+# inialize function by 'init-detect-language-by-ext'
 function detect-language-by-ext {
-	# boilerplate for _create-detect-language-by-ext
-	# usage:
-	#  1. source /dev/stdin < <(_create-detect-language-by-ext)
-	#  2. detect-language-by-ext "sh"
-	true
+	warn "function detect-language-by-ext not defined"
 }
 
-function _create-detect-language-by-ext {
+###
+# Init function for detect-language-by-ext
+function init-detect-language-by-ext {
 	local IFS
 	IFS=$'\t'
-
-	cat <<- 'EOM'
-	function detect-language-by-ext {
-		local lang=""
-		case "${1?ext}" in
-	EOM
-	while read -r lang matches; do 
-		case="$(echo "$matches" | sed -r 's/(^|\t)([a-zA-Z]+)(\t|$)/\1*\.\2|\2\3/g; s/(^|\t)(\.)/\1*/g; s/ /\\ /g' | tr '\t' '|')"
-			printf "\t%s)\n\t\t lang=%q\n\t\t;;\n" "$case" "$lang"
-	done < <(bat --list-languages | tr ',:' $'\t')
-	cat <<- 'EOM'
-		esac
-		echo "$lang"
-	}
-	EOM
+	source <(
+		cat <<- 'EOM'
+			function detect-language-by-ext {
+				local lang=""
+				case "${1?ext}" in
+			EOM
+			while read -r lang matches; do 
+				case="$(echo "$matches" | sed -r 's/(^|\t)([a-zA-Z]+)(\t|$)/\1*\.\2|\2\3/g; s/(^|\t)(\.)/\1*/g; s/ /\\ /g' | tr '\t' '|')"
+					printf "\t%s)\n\t\t lang=%q\n\t\t;;\n" "$case" "$lang"
+			done < <(bat --list-languages | tr ',:' $'\t')
+			cat <<- 'EOM'
+				esac
+				echo "$lang"
+			}
+		EOM
+	)
+	declare -xf detect-language-by-ext
 }
 
 
@@ -1069,13 +1118,26 @@ function post {
 	fi
 }
 
+function check-required-commands {
+	req-bin jq --version -ge 1.7
+	req-bin bat --version -ge 0.22
+	req-bin curl --version -ge 7
+	req-bin bash --version -ge 5.0	
+}
+
 function main() {	
+	
+	check-required-commands
+
 	trap  shutdown INT EXIT QUIT
 
 	TMP="$(mktemp -d)"
 	debug "Temp directory is $TMP. Not cleaning up!" 
+	
 	init-args "$@"
-	source /dev/stdin < <(_create-detect-language-by-ext)	
+	
+	init-detect-language-by-ext
+
 	request
 	output | output_format_filter
 }

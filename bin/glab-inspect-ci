@@ -135,20 +135,42 @@ function main {
 	local job_name=""
 	local pipeline_ref=""
 	local pipeline_commit=""
+	local project_id=""
+	local group_id=""
+	local project_json=""
 	local job_json=""
 	local pipeline_definition_json=""
 	local is_protected_branch=0
+	local group_path=""
 	check-token
 	# job_json=$(echo "https://gitlab.com/myorg/mygroup/mysubgroup/myproject/-/jobs/6970154188"  | jq -R 'capture("https://(?<gitlab_host>[^/]+)/(?<project_path>.+)/-/(jobs/(?<job_id>\\d+))?")' | tee /dev/tty )""
-	job_json="$(echo "$@" | jq -R 'capture("https://(?<gitlab_host>[^/]+)/(?<project_path>.+)/-/(jobs/(?<job_id>\\d+))?")')"
-	if [[ -n "$job_json" ]]; then
-		project_path="$(jq -r .project_path <<< "$job_json")"
-		job_id="$(jq -r .job_id <<< "$job_json")"
-	fi
+	json="$(echo "$@" | jq -R '
+		capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/jobs/(?<job_id>\\d+)")
+		// capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/pipeline/(?<pipeline_id>\\d+)")
+		// capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/.+")
+		// capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)")
+	' )"
+	local type=""
 
+	if [[ -n "$json" ]]; then
+		path="$(jq -r .path <<< "$json")"
+		# if manually specified
+		path="${path#/}"  # prefix
+		path="${path%/}"  # suffix	
+		json="$(get-namespace-info "$path")"
+		type="$(jq -r .type <<< "$json")"
+		if [[ "$type" == "project" ]]; then
+				project_path="$path"
+		elif [[ "$type" == "group" ]]; then
+				group_path="$path"
+		fi
+		job_id="$(jq -r '.job_id|values' <<< "$json")"
+		pipeline_id="$(jq -r '.pipeline_id|values' <<< "$json")"
+	fi
 	if [[ -z "$project_path" ]]; then
 		project_path="$1"
 	fi
+
 	# if manually specified
 	project_path="${project_path#/}"  # prefix
 	project_path="${project_path%/}"  # suffix
@@ -158,13 +180,15 @@ function main {
 		exit 1
 	fi
 
-	printf "Resolving %s…" "$project_path" >&2
-	project_json="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$(jq -Rr @uri <<< "$project_path")" | jq)"	
-	project_path="$(jq -r .path_with_namespace <<< "$project_json")"
-	project_id="$(jq -r .id <<< "$project_json")"
+	if [[ "$type" == "project" ]]; then
+		printf "Resolving %s…" "$project_path" >&2
+		project_json="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$(jq -Rr @uri <<< "$project_path")" | jq)"	
+		project_path="$(jq -r .path_with_namespace <<< "$project_json")"
+		project_id="$(jq -r .id <<< "$project_json")"
+	fi
 
 	if [[ -n "$job_id" ]]; then
-		job_json="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/${project_id}/jobs/${job_id}" | jq)"
+		job_json="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/${project_id}/jobs/${job_id}" | jq || true)"
 		# "failure_reason": "script_failure",
 		# artifacts
 	fi
@@ -176,8 +200,9 @@ function main {
 		is_protected_branch="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$project_id/protected_branches" | jq -r --arg pipeline_ref "$pipeline_ref" '[.[].name]|if any(.==$pipeline_ref) then "1" else "0" end')"
 	fi
 	
-
-	printf "\e[2K\rGot project_id=%d for %s\n" "$project_id" "$project_path" >&2
+	if [[ -n "$project_id" ]]; then
+		printf "\e[2K\rGot project_id=%d for %s\n" "$project_id" "$project_path" >&2
+	fi
 
 	while IFS='' read -r json_item _; do
 		type="$(jq -r .type <<< "$json_item")"
@@ -200,7 +225,7 @@ function main {
 				]|sort[]' <<< "$json_vars"  | bat -l bash --decorations=never 
 		    #TODO "environment_scope": "npd-blue-ue1",
 		fi
-	done < <(resolve-gitlab-path "$project_path" | jq -c 'reverse[]' )
+	done < <(resolve-gitlab-path "$path" | jq -c 'reverse[]' )
 
 
 	info ""

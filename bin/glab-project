@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -e "$git_root/.git/config" ]]; then
+	while read -r project _; do
+		if [[ -n "$project" ]]; then
+			(
+				set -x;
+				curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$(jq -Rr @uri <<< "$project")/" \
+					| jq --arg ns "$project"  '{project_id: .id, name, path: .path_with_namespace, description, web_url, ssh_url_to_repo, http_url_to_repo}' \
+					| dasel -r json -w yaml | bat -l yaml  --decorations never 
+				exit 0
+			) 2>/dev/null 
+		fi
+	done < <(cat "$git_root/.git/config" | jq -Rr 'capture("git@(?=.*gitlab)([^:]+):(?<project>(([^/]+/))+[^\\.]+)(\\.git)?")|.project' | sort -u)
+fi
+
+exit 1
