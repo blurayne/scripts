@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+function get-claim-names {
+	# jenkins-pvc
+	local pod="${1?pod}"
+	local ns="${2?ns}"
+	kubectl get pod "$pod" -n "$ns" -ojson | jq -r '..|.persistentVolumeClaim?.claimName?|values'
+}
+
+function get-volume-names {
+	# like pvc-2a1a17c7-465d-11e9-8bec-126d617c9422"
+	local claim_name="${1?claim-name}"
+	local ns="${2?ns}"
+	kubectl get pvc -n "$ns" -ojson | jq -r --arg ns "$ns" --arg claim_name "$claim_name" '.items[]|select(.metadata.name==$claim_name)|select(.metadata.namespace==$ns)|.spec.volumeName'
+}
+
+function get-volume-info {
+	local volume_name="${1?volume-name}"
+	local ns="${2?ns}"
+	kubectl get pv -n "$ns" -ojson | jq -r --arg volume_name "$volume_name" --arg ns "$ns" '.items[]|select(.metadata.name==$volume_name)|select(.spec.claimRef.namespace==$ns)|.spec.nfs'
+	# k get pv  -n data-apps -ojson | jq '.items[]|select(.metadata.name=="pvc-2a1a17c7-465d-11e9-8bec-126d617c9422")|.spec.nfs'
+}
+
+function get-ips {
+	local fs_id="${1?file-system-id}"
+	local region="${2?region}"
+	aws efs describe-mount-targets --file-system-id "$fs_id" --region "$region" | jq -r '.MountTargets[]|.IpAddress'
+}
+
+function main {
+	local pod="${1?pod}"
+	local ns="${2?ns}"
+	local volume_info_json=""
+	for claim_name in $(get-claim-names "$pod" "$ns"); do
+		for volume_name in $(get-volume-names "$claim_name" "$ns"); do
+			echo "POD $pod"
+			echo "CLAIM NAME $claim_name"
+			echo "VOLUME NAME $volume_name"
+			volume_info_json="$(get-volume-info "$volume_name" "$ns")"
+			echo "PATH $(jq -r .path <<< "$volume_info_json")"
+			server="$(jq -r .server <<< "$volume_info_json")"
+			echo "SERVER $server"
+			#grep -oP '^fs-[a-z0-9]+' <<< "$server"
+			fs_id="${server%%.*}"
+			region="$(grep -oP '^[^\.]+\.[^\.]+\.\K[^\.]+' <<< "$server")"
+			echo "REGION $region"
+			# aws efs describe-mount-targets --file-system-id fs-18e13af9 | jq -r '.MountTargets[]|.IpAddress'
+			# volume_info_json
+			# aws efs describe-file-systems --file-system-id fs-18e13af9 
+			for ip in $(get-ips "$fs_id" "$region"); do
+				echo "IP $ip"
+				echo "sudo mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport $ip:/ /mnt/efs"
+			done
+		done
+	done
+	
+}
+main "$@"
+
+
+
+
+

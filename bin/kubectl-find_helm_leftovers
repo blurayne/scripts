@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+TMP="$(mktemp -d)"
+
+##
+# Find Helm leftovers in you K8s Cluster
+#
+# if it's in your PATH with the file nameing as suggested you can use it by 
+#   kubectl find-helm-leftovers 
+
+
+function shutdown {
+	if [[ -d "$TMP" ]]; then rm -fr "$TMP" &>/dev/null || true; fi
+}
+
+trap shutdown INT EXIT QUIT
+
+helm list -A -ojson | jq -r 'sort_by(.namespace,.name)[]' > "$TMP/helm-releases.jsonl"
+kubectl get all -A -l 'app.kubernetes.io/managed-by in (Helm,Tiller)' -ojson | jq '.items[]' > "$TMP/k8s-releases.jsonl"
+
+echo "Check K8s Resources match listed Helm Releases"
+echo "(false → release in target namespace not found, resource is a leftover)"
+echo
+echo
+
+jq -nr --slurpfile k "$TMP/k8s-releases.jsonl" --slurpfile helm_releases "$TMP/helm-releases.jsonl" '
+        $k[]
+        |.metadata.annotations["meta.helm.sh/release-namespace"] as $release_ns
+        |.metadata.annotations["meta.helm.sh/release-name"] as $release_name
+        |.metadata.labels["helm.sh/chart"] as $resource_chart_version
+        |.metadata.name as $name
+        |.metadata.namespace as $ns
+        |.kind as $kind
+        |.version as $version
+        |select($release_ns and $release_name)
+        |(any(select($helm_releases[]|select(.namespace==$release_ns)|select(.name==$release_name))) // false) as $found
+        |[$release_ns,$release_name,$resource_chart_version // "n/a", $kind, $name, $found]|@tsv' \
+        | sort  \
+        | sed '1i NAMESPACE\tHELM RELEASE NAME\tCHART\tKIND\tRESOURCE NAME\tVALID' \
+        | column -s$'\t' -t
+
+
+echo
+echo
+echo "Check K8s Resources match current chart versions"
+echo "(false → chart not found, resource is a leftover)"
+echo
+echo
+
+jq -nr --slurpfile k "$TMP/k8s-releases.jsonl" --slurpfile helm_releases "$TMP/helm-releases.jsonl" '
+        $k[]
+        |.metadata.name as $name
+        |.metadata.namespace as $ns
+        |.kind as $kind
+        |.version as $version
+        |.metadata.labels["helm.sh/chart"] as $resource_chart_version
+        |select($resource_chart_version)
+        |(any(select($helm_releases[]|select(.chart==$resource_chart_version))) // false) as $found
+        |[$ns, $name, $kind, $resource_chart_version, $found, (.status?.conditions?[-1].type // (.status?|tojson))]|@tsv' \
+        | sort  \
+        | sed '1i NAMESPACE\tRESOURCE NAME\tKIND\tHELM CHART\tVALID\tRESOURCE STATUS' \
+        | column -s$'\t' -t
+
+# TODO further investigate by looking in which kubernetes.io/apps
