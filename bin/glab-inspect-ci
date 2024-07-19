@@ -145,27 +145,33 @@ function main {
 	check-token
 	# job_json=$(echo "https://gitlab.com/myorg/mygroup/mysubgroup/myproject/-/jobs/6970154188"  | jq -R 'capture("https://(?<gitlab_host>[^/]+)/(?<project_path>.+)/-/(jobs/(?<job_id>\\d+))?")' | tee /dev/tty )""
 	json="$(echo "$@" | jq -R '
-		capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/jobs/(?<job_id>\\d+)")
-		// capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/pipeline/(?<pipeline_id>\\d+)")
-		// capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/.+")
-		// capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)")
+		
+		[
+			capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/jobs/(?<job_id>\\d+)") // {},
+			capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/pipeline/(?<pipeline_id>\\d+)") // {},
+			capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/.+") // {},
+			capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)") // {}
+		]
+		|reduce .[] as $obj ({};. as $in|. * ([$obj|to_entries[]|.value=($in["\(.key)"] as $v|if ($v!=null) then $v else .value end)]|from_entries))
 	' )"
-	local type=""
+
 
 	if [[ -n "$json" ]]; then
 		path="$(jq -r .path <<< "$json")"
 		# if manually specified
 		path="${path#/}"  # prefix
 		path="${path%/}"  # suffix	
-		json="$(get-namespace-info "$path")"
-		type="$(jq -r .type <<< "$json")"
+		job_id="$(jq -r '.job_id|values' <<< "$json")"
+		pipeline_id="$(jq -r '.pipeline_id|values' <<< "$json")"
+		
+		pjson="$(get-namespace-info "$path")"
+		type="$(jq -r .type <<< "$pjson")"
 		if [[ "$type" == "project" ]]; then
 				project_path="$path"
 		elif [[ "$type" == "group" ]]; then
 				group_path="$path"
 		fi
-		job_id="$(jq -r '.job_id|values' <<< "$json")"
-		pipeline_id="$(jq -r '.pipeline_id|values' <<< "$json")"
+		
 	fi
 	if [[ -z "$project_path" ]]; then
 		project_path="$1"
@@ -187,6 +193,7 @@ function main {
 		project_id="$(jq -r .id <<< "$project_json")"
 	fi
 
+
 	if [[ -n "$job_id" ]]; then
 		job_json="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/${project_id}/jobs/${job_id}" | jq || true)"
 		# "failure_reason": "script_failure",
@@ -199,6 +206,7 @@ function main {
 		pipeline_commit="$(jq -r .commit.id <<< "$job_json")"
 		is_protected_branch="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$project_id/protected_branches" | jq -r --arg pipeline_ref "$pipeline_ref" '[.[].name]|if any(.==$pipeline_ref) then "1" else "0" end')"
 	fi
+
 	
 	if [[ -n "$project_id" ]]; then
 		printf "\e[2K\rGot project_id=%d for %s\n" "$project_id" "$project_path" >&2

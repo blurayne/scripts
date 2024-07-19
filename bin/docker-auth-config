@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+registry=""
+username=""
+password=""
+email=""
+configs=()
+jq_args=()
+merge_file_cnt=0
+target_file=""
+opt_existing=1
+opt_commit=0
+opt_k8s=0
+
+# TODO might need some improvement depending on where config lies
+function get_default_config_file {
+	if [[ -n "${REGISTRY_AUTH_FILE:-}" ]]; then
+		echo "${REGISTRY_AUTH_FILE:-}"
+		return 0
+	elif [[ -n "${DOCKER_CONFIG:-}" ]]; then
+		echo "${DOCKER_CONFIG:-}/config.json"
+		return 0
+	fi
+	files=(
+		"${XDG_RUNTIME_DIR:-/run/user/${UID}}/containers/auth.json"
+		"$HOME/.config/containers/auth.json"
+		"/etc/containers/auth.json"
+		"$HOME/.docker/config.json"
+		"/etc/docker/config.json"
+		"$HOME/.dockercfg"
+		"/etc/docker/dockercfg"
+	)
+	for file in "${files[@]}"; do
+		if [[ -r "$file" ]]; then
+			echo "$file"
+			return 0
+		fi
+	done
+	if [[ -e /kaniko ]]; then
+	 	echo "/kaniko/.docker/config.json"
+	elif command -v docker 2>&1; then
+		echo "$HOME/.docker/config.json"
+	else
+		echo "$HOME/.config/containers/auth.json"
+	fi
+}
+
+function output {
+	local tmp
+	if  [[ "$opt_k8s" -eq 1 ]]; then
+		tmp="$(mktemp)"
+		cat > "$tmp" 
+		echo "# kubectl create secret docker-registry docker-registry --from-file=.dockerconfigjson=FILE -n NAMESPACE --dry-run=client -oyaml" >&2
+		kubectl create secret docker-registry docker-registry --from-file=.dockerconfigjson=$tmp -n example --dry-run=client -oyaml
+	elif [[ "$opt_commit" -eq 1 ]] && [[ -n "$target_file" ]]; then
+		tmp="$(mktemp)"
+		echo "writing to ${target_file%/*}" >&2
+		if [[ ! -d "${target_file%/*}" ]]; then
+			mkdir -p "${target_file%/*}"
+		fi
+		cat > "$tmp" 
+		cat "$tmp" > "$$target_file"
+	else
+		echo "output only to stdout" >&2
+		cat
+	fi
+}
+
+while [[ $# -gt 0 ]]; do
+	arg="$1"
+	shift 1
+	case "$arg" in 
+		--password-stdin)
+			password=$(</dev/stdin)
+			;;
+		-u|--username)
+			arg="${1?username}"
+			shift 1
+			username="$arg"
+			;;
+		-p|--password)
+			arg="${1?password}"
+			shift 1
+			password="$arg"
+			;;
+		-e|--email)
+			arg="${1?password}"
+			shift 1
+			password="$arg"
+			;;
+		-c|--config)
+			arg="${1?config}"
+			configs+=("$arg")
+			shift 1
+			;;
+		-f|--file)
+			arg="${1?file}"
+			shift 1
+			target_file="$arg"
+			;;
+		-k|--commit)
+			# write to existing file
+			opt_commit=1
+			;;
+		-n|--new)
+			# empty
+			opt_existing=0
+			;;
+
+		--k8s)
+			opt_k8s=1;;
+		*)
+			if [[ -n "$registry" ]]; then
+				echo "unexpected: $arg. registry already set." >&2
+				exit 1
+			fi
+			# extra_args
+			registry="$arg"
+			;;
+	esac
+done
+
+if [[ -z "$registry" ]]; then
+	echo "error: no registry set" >&2
+	exit 1
+fi
+if [[ "$opt_existing" -eq 1 ]] && [[ -z "$target_file" ]]; then
+	target_file="$(get_default_config_file)"
+	if [[ -e "$target_file" ]]; then
+		configs=("$target_file" "${configs[@]}")
+	fi
+fi
+for file in "${configs[@]}"; do
+	let 'merge_file_cnt+=1'
+	echo "using ${file}" >&2
+	jq_args+=(--slurpfile "file${merge_file_cnt}" "$file")
+done
+
+jq -nr "${jq_args[@]}" --arg username "$username" --arg password "$password" --arg registry "$registry" --arg email "$email" '
+	def namedArg(p): $ARGS.named | getpath([p]);
+
+	def merge(obj2): 
+	  if (type == "object" and (obj2 | type) == "object") then
+	    reduce ((keys + (obj2 | keys)) | unique)[] as $key (.;
+	      if (has($key) and (obj2 | has($key))) then
+	        .[$key] |= (. | merge(obj2[$key]))
+	      elif (obj2 | has($key)) then
+	        .[$key] |= obj2[$key]
+	      else
+	        .
+	      end
+	    )
+	  elif (((obj2|type)!="null") and ((obj2|scalars|true)//false)) then  	
+	  	("\(obj2)\n"|stderr) as $x|.|obj2
+
+	  elif (type == (obj2 | type)) then
+	    . + obj2
+	  else
+	    error("Cannot merge " + type + " and " + (obj2 | type))
+	  end
+	;
+
+ 	def secret($registry; $username; $token;  $email):
+ 		{ 
+ 			$registry: (
+ 				{
+	 					username:$username,
+	 					password:$token,
+	 					auth:("\($username):\($token)"|@base64)
+	 			} 
+	 			* (if ($email!="") then { email:$email } else { email:"user@example.com"  } end)
+ 			)
+ 		};
+
+	($ARGS.named|to_entries|map(select(.key|startswith("file"))|.value)|add) as $files
+	|{
+ 		auths: ([
+ 			secret($registry;$username;$password;$email)
+ 		]|add)                                                                                                                                                                                                                                                         
+ 	}
+ 	|if ($files|length>0) then reduce $files[] as $item (.; merge($item)) else . end
+ '  | output
+
+
