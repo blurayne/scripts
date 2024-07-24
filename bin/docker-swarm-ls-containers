@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+docker node ps $(docker node ls -q) "$@"
+

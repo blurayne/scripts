@@ -18,6 +18,85 @@ BASENAME="${0##*/}"
 DEBUG=0
 COLORIZE=-1
 
+export TMP="$(mktemp -d)"
+
+function shutdown {
+	if [[ "$DEBUG" -ne 1 ]] && [[ -d "$TMP" ]]; then
+		rm -fr "$TMP"
+	fi
+}
+
+trap  shutdown INT EXIT QUIT
+
+function hypercurl {
+	local url="${1?url}"
+	local pagecount="1"
+	local page=1
+	local per_page=-1
+	local total_pages=-1
+	local expected_results=0
+
+	if [[ ! -e $TMP/headers ]]; then
+		mkfifo "$TMP/headers" 
+	fi
+	if [[ ! -e $TMP/headers ]]; then
+		mkfifo "$TMP/var" 
+	fi
+
+	(
+			while read -r line; do
+				if [[ "$line" =~ x-total-pages:\ ([0-9]+) ]]; then
+					printf "total_pages=%d\n" "${BASH_REMATCH[1]}"
+				fi
+				if [[ "$line" =~ x-page:\ ([0-9]+) ]]; then
+					printf "page=%d\n" "${BASH_REMATCH[1]}"
+				fi
+				if [[ "$line" =~ x-per-page:\ ([0-9]+) ]]; then
+					printf "per_page=%d\n" "${BASH_REMATCH[1]}"
+				fi
+
+			done < "$TMP/headers"  > "$TMP/var" 
+	) &
+	printf "\e[2K\rWaiting for results" >&2
+	
+	
+	curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$url" -D "$TMP/headers" | jq -c '.[]' > "$TMP/results.jsonl"
+	source /dev/stdin < "$TMP/var" 
+	expected_results=$((total_pages * per_page))
+	
+	if [[ "$page" -eq 1 ]] && [[ "$total_pages" -gt 1 ]]; then
+		(
+			mkdir "$TMP/pages"
+			for ((i=page+1;i<=total_pages;i++)); do
+				cat <<-EOM 
+				url=${url}&page=$i
+				-o $TMP/pages/$i.json
+				EOM
+			done 
+		) > "$TMP/curl-urls"		
+		(
+			
+			while read -r line; do
+				if [[ "$line" =~ HTTP/[0-9\.]\ 200 ]]; then
+					let 'pagecount+=1'
+					printf "\e[2K\r%s of %s pages retrieved"  "$pagecount" "$total_pages" >&2
+				fi
+				
+			done < "$TMP/headers" 
+		) &
+		
+		curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" --parallel --config "$TMP/curl-urls" -D "$TMP/headers"   \
+			| jq -cr '
+				.[]
+			' 
+		cat "$TMP/pages/"* | jq -c '.[]' >> "$TMP/results.jsonl"
+		rm -fr "$TMP/pages"
+	fi
+	
+	rm "$TMP/headers"
+	printf "\e[2K\r" >&2
+}
+
 function is-color {
 	if  [[ "$COLORIZE" -eq 1 ]] || ( [[ "$COLORIZE" -eq -1 ]] && [[ -t 1 ]] ); then
 		COLORIZE=1
@@ -150,7 +229,9 @@ function main {
 			capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/jobs/(?<job_id>\\d+)") // {},
 			capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/pipeline/(?<pipeline_id>\\d+)") // {},
 			capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)/-/.+") // {},
-			capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)") // {}
+			capture("https://(?<gitlab_host>[^/]+)/(?<path>.+)") // {},
+			capture("(?<path>/?[a-z].+)") // {},
+			(capture("^(?<gitlab_host>[^\\.]+\\.[^/]+)/(?<path>.+)")|.gitlab_host="www.gitlab.com") // {}
 		]
 		|reduce .[] as $obj ({};. as $in|. * ([$obj|to_entries[]|.value=($in["\(.key)"] as $v|if ($v!=null) then $v else .value end)]|from_entries))
 	' )"
@@ -216,10 +297,12 @@ function main {
 		type="$(jq -r .type <<< "$json_item")"
 		path="$(jq -r .path <<< "$json_item")"
 		name="$(jq -r .name <<< "$json_item")"
+		id="$(jq -r .id <<< "$json_item")"
 		description="$(jq -r .description <<< "$json_item")"
 		info ""
-		info "$(printf "Variables of %s (%s-level) – %s %s "  "$path" "$type" "$name" "$description")"
-		json_vars="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/${type}s/$(jq -Rr @uri <<< "$path")/variables" | jq -c || true)"
+		info "$(printf "Variables of %s (%s-level %s ) – %s %s "  "$path" "$type" "$id" "$name" "$description")"
+		# TODO: we need next-page handling here per_page=100
+		json_vars="$(curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/${type}s/$(jq -Rr @uri <<< "$path")/variables?per_page=100" | jq -c || true)"
 		if [[ -z "$json_vars" ]]; then
 			echo "No access (use pipeline to expose vars!)"
 		else
@@ -229,7 +312,11 @@ function main {
 					.[]
 					|select(.variable_type?=="env_var")
 					|((.protected) and ($is_protected_branch|not)) as $do_comment
-					|"\(if $do_comment then "# " else "" end)\(.key)=\(.value|@sh) \(if .protected then "; : protected" else "" end)"
+					|([
+						(if (.description) then "# \(.description)" else "" end),
+						(if (.environment_scope!="*") then "# scope: \(.environment_scope)" else "" end),
+						"\(if $do_comment then "# " else "" end)\(.key)=\(.value|@sh) \(if .protected then "; : protected" else "" end)"
+					]|map(select(.!=""))|join("\n"))
 				]|sort[]' <<< "$json_vars"  | bat -l bash --decorations=never 
 		    #TODO "environment_scope": "npd-blue-ue1",
 		fi
@@ -304,9 +391,10 @@ function main {
 	project_name="$(jq -r .name <<< "$project_json")"
 	url="$project_url/-/tree/$pipeline_ref"
 	
-
-	info "$project_name (project_id=$project_id)"
-	echo >&2
+	if [[ -n "$project_name" ]]; then
+		info "$project_name (project_id=$project_id)"
+		echo >&2
+	fi
 	if [[ -n "$pipeline_commit" ]]; then
 		printf "%s\n" "$(href "$url" "$url")"
 		printf "%s\n" "---"

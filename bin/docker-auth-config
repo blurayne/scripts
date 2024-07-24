@@ -13,27 +13,44 @@ target_file=""
 opt_existing=1
 opt_commit=0
 opt_k8s=0
+opt_check=0
+runtime="docker"
 
 # TODO might need some improvement depending on where config lies
 function get_default_config_file {
-	if [[ -n "${REGISTRY_AUTH_FILE:-}" ]]; then
+	local files=()
+	if [[ -n "${REGISTRY_AUTH_FILE:-}" ]] && [[ "$runtime" != "docker" ]]; then
 		echo "${REGISTRY_AUTH_FILE:-}"
 		return 0
 	elif [[ -n "${DOCKER_CONFIG:-}" ]]; then
 		echo "${DOCKER_CONFIG:-}/config.json"
 		return 0
 	fi
-	files=(
-		"${XDG_RUNTIME_DIR:-/run/user/${UID}}/containers/auth.json"
-		"$HOME/.config/containers/auth.json"
-		"/etc/containers/auth.json"
-		"$HOME/.docker/config.json"
-		"/etc/docker/config.json"
-		"$HOME/.dockercfg"
-		"/etc/docker/dockercfg"
-	)
+	if  [[ "$runtime" != "docker" ]]; then
+		files=(
+			"${XDG_RUNTIME_DIR:-/run/user/${UID}}/containers/auth.json"
+			"$HOME/.config/containers/auth.json"
+			"/etc/containers/auth.json"
+			"$HOME/.docker/config.json"
+			"/etc/docker/config.json"
+			"$HOME/.dockercfg"
+			"/etc/docker/dockercfg"
+		)
+	else
+		files=(
+			"${XDG_RUNTIME_DIR:-/run/user/${UID}}/containers/auth.json"
+			"$HOME/.config/containers/auth.json"
+			"/etc/containers/auth.json"
+			"$HOME/.docker/config.json"
+			"/etc/docker/config.json"
+			"$HOME/.dockercfg"
+			"/etc/docker/dockercfg"
+		)
+	fi
+
 	for file in "${files[@]}"; do
-		if [[ -r "$file" ]]; then
+		# check for writable files
+		if [[ -w "$file" ]]; then
 			echo "$file"
 			return 0
 		fi
@@ -53,17 +70,19 @@ function output {
 		tmp="$(mktemp)"
 		cat > "$tmp" 
 		echo "# kubectl create secret docker-registry docker-registry --from-file=.dockerconfigjson=FILE -n NAMESPACE --dry-run=client -oyaml" >&2
-		kubectl create secret docker-registry docker-registry --from-file=.dockerconfigjson=$tmp -n example --dry-run=client -oyaml
+		kubectl create secret docker-registry docker-registry "--from-file=.dockerconfigjson=$tmp" -n example --dry-run=client -oyaml
 	elif [[ "$opt_commit" -eq 1 ]] && [[ -n "$target_file" ]]; then
 		tmp="$(mktemp)"
-		echo "writing to ${target_file%/*}" >&2
+		echo "writing to ${target_file}" >&2
 		if [[ ! -d "${target_file%/*}" ]]; then
 			mkdir -p "${target_file%/*}"
 		fi
+
 		cat > "$tmp" 
-		cat "$tmp" > "$$target_file"
+		cat "$tmp" > "$target_file"
+
 	else
-		echo "output only to stdout" >&2
+		echo "output only to stdout. no files are written." >&2
 		cat
 	fi
 }
@@ -74,6 +93,14 @@ while [[ $# -gt 0 ]]; do
 	case "$arg" in 
 		--password-stdin)
 			password=$(</dev/stdin)
+			;;
+		--get-config-file)
+			get_default_config_file
+			;;
+		--runtime)
+			arg="${1?runtime}"
+			shift
+			runtime="${arg}"
 			;;
 		-u|--username)
 			arg="${1?username}"
@@ -86,21 +113,29 @@ while [[ $# -gt 0 ]]; do
 			password="$arg"
 			;;
 		-e|--email)
-			arg="${1?password}"
+			arg="${1?email}"
 			shift 1
-			password="$arg"
+			email="$arg"
 			;;
 		-c|--config)
 			arg="${1?config}"
 			configs+=("$arg")
 			shift 1
 			;;
+		-r|--registry)
+			arg="${1?registry}"
+			shift 1
+			registry="$arg"
+			;;
+		--check)
+			opt_check=1
+			;;
 		-f|--file)
 			arg="${1?file}"
 			shift 1
 			target_file="$arg"
 			;;
-		-k|--commit)
+		-w|--write|-k|--commit)
 			# write to existing file
 			opt_commit=1
 			;;
@@ -138,6 +173,17 @@ for file in "${configs[@]}"; do
 	jq_args+=(--slurpfile "file${merge_file_cnt}" "$file")
 done
 
+
+if [[ "$opt_check" -eq 1 ]]; then
+	echo "checking credentials for $registry" >&2
+	if check-docker-credentials "$registry" "$username" "$password" &>/dev/null; then
+		echo "credentials for $registry are valid" >&2
+	else
+		echo "credentials for $registry failed verification" >&2
+		exit 1
+	fi
+fi
+
 jq -nr "${jq_args[@]}" --arg username "$username" --arg password "$password" --arg registry "$registry" --arg email "$email" '
 	def namedArg(p): $ARGS.named | getpath([p]);
 
@@ -153,7 +199,7 @@ jq -nr "${jq_args[@]}" --arg username "$username" --arg password "$password" --a
 	      end
 	    )
 	  elif (((obj2|type)!="null") and ((obj2|scalars|true)//false)) then  	
-	  	("\(obj2)\n"|stderr) as $x|.|obj2
+	  	("\(obj2)\n") as $x|.|obj2
 
 	  elif (type == (obj2 | type)) then
 	    . + obj2
@@ -182,5 +228,3 @@ jq -nr "${jq_args[@]}" --arg username "$username" --arg password "$password" --a
  	}
  	|if ($files|length>0) then reduce $files[] as $item (.; merge($item)) else . end
  '  | output
-
-
