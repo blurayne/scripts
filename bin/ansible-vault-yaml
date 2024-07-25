@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+
+# requirements: pip install ansible ruamel.yaml python-benedict
+
+## TODO https://docs.ansible.com/ansible/latest/user_guide/vault.html#choosing-between-a-single-password-and-multiple-passwords
+
+## https://github.com/ansible/ansible/blob/0c4c18bc04c562755a368df67fce943ca15418ee/lib/ansible/parsing/vault/__init__.py
+## https://github.com/ansible/ansible/blob/4b0697ee03ee02570b5e0c29ac73446959740515/lib/ansible/cli/__init__.py
+
+#ANSIBLE_VAULT_ID_MATCH
+#If true, decrypting vaults with a vault id will only try the password from the matching vault-id
+#See also DEFAULT_VAULT_ID_MATCH
+
+# --vault-id test@multi_password_file foo.yml
+# --vault-id my_new_password@prompt   VaultSecret  PromptVaultSecret FileVaultSecret ScriptVaultSecret get_file_vault_secret(filename=None, vault_id=None, encoding=None, loader=None):
+
+#ANSIBLE_VAULT_IDENTITY
+#The label to use for the default vault id label in cases where a vault id label is not provided
+#See also DEFAULT_VAULT_IDENTITY
+
+#ANSIBLE_VAULT_ENCRYPT_IDENTITY
+#The vault_id to use for encrypting by default. If multiple vault_ids are provided, this specifies which to use for encryption. The –encrypt-vault-id cli option overrides the configured value.
+#See also DEFAULT_VAULT_ENCRYPT_IDENTITY
+
+#ANSIBLE_VAULT_IDENTITY_LIST
+#A list of vault-ids to use by default. Equivalent to multiple –vault-id args. Vault-ids are tried in order.
+
+#See also DEFAULT_VAULT_IDENTITY_LIST
+#ANSIBLE_VAULT_PASSWORD_FILE
+
+"""
+usage: ansible-vault-yaml [-d] [-D] [-e] [-i] [-N] [-p VAULT_PASS] [-h] [file] [path] [value]
+
+Edit Ansible Vault YAML tags
+
+positional arguments:
+  file                  YAML File
+  path                  Affected YAML path
+  value                 Value to set
+
+options:
+  -d, --decrypt         Decrypt the value (default)
+  -D, --delete          delete a key
+  -e, --encrypt         Encrypt the value
+  -i, --commit         Replace file
+  -N, --continue_on_errors        Ignore errors
+  -p VAULT_PASS, --password VAULT_PASS
+                        Password (preferer using ANSIBLE_VAULT_PASSWORD or ANSIBLE_VAULT_PASSWORD_FILE)
+  -h, --help            Show this help message and exit
+
+environment:
+  ANSIBLE_VAULT_PASSWORD        Ansible Vault password
+  ANSIBLE_VAULT_PASSWORD_FILE   Ansible Vault password file
+
+examples:
+  ansible-vault-yaml -d file.yaml                     Decrypt everything
+  ansible-vault-yaml -d file.yaml path.key            Decrypt single key
+  ansible-vault-yaml file.yaml path.key value         Set single key and value
+  ansible-vault-yaml -e file.yaml path.key value      Set single encrypted key and value
+  ansible-vault-yaml -i -e file.yaml path.key value   …then replace file by adding -i
+  ansible-vault-yaml -D file.yaml path.key            Delete key 
+  ansible-vault-yaml -R newkey file.yaml              Rekey with newkey (and preview)
+  ansible-vault-yaml -i -R newkey file.yaml           …then replace file
+  ansible-vault-yaml -d -p newkey file.yaml           …then check file (decrypting everything)
+  ansible-vault-yaml file.yaml                        …then check file (should show !vault again)
+
+notes:
+  pathes like my.key.list[0] are possible. we use ruamel (not pyaml) to ensure integrity of original content.
+  you can use '-' for /dev/stdin
+  if you don't think a shared secret is sufficient use Mozilla SOPS (https://github.com/mozilla/sops)
+
+"""
+
+import os
+import sys
+import io
+import pathlib
+from ansible.constants import DEFAULT_VAULT_ID_MATCH
+from ansible.parsing.vault import VaultLib, VaultSecret
+import ruamel.yaml
+from collections import OrderedDict
+from benedict import benedict
+import argparse
+from getpass import getpass
+from collections.abc import Iterable
+from ruamel.yaml.comments import CommentedSeq
+class VaultString:
+  def __init__(self, string, vault):
+    self.string = string
+    self.vault = vault
+  def __repr__(self):
+    return self.string
+  def set_vault(self, vault):
+    self.vault = vault
+  def encrypt(self):
+    self.string = self.vault.encrypt(self.string).decode('utf8')
+    return self.string
+  def decrypt(self):
+    return self.vault.decrypt(self.string)
+  def update(self, new_value):
+    self.string = self.vault.encrypt(new_value).decode('utf8')
+    return True
+
+class App:
+
+    args: dict
+    yaml: ruamel.yaml.YAML = None
+    yaml_data: dict = None
+    original_content: str = ''
+    yaml_accessor: benedict = None
+    file_exists: bool = False
+    vault: VaultLib = None
+    rekey_vault: VaultLib = None
+
+    def usage(self):
+        self.parser.print_help()
+        print("")
+        print("environment:")
+        print("  ANSIBLE_VAULT_PASSWORD        Ansible Vault password")
+        print("  ANSIBLE_VAULT_PASSWORD_FILE   Ansible Vault password file")   
+        print("")
+        print("examples:")
+        print("  ansible-vault-yaml file.yaml                        Parse without using vault and just display")
+        print("  ansible-vault-yaml -d file.yaml                     Decrypt everything (Vault env have to be set!)")
+        print("  ansible-vault-yaml -d file.yaml path.key            Decrypt single key")
+        print("  ansible-vault-yaml file.yaml path.key value         Set single key and value")
+        print("  ansible-vault-yaml -e file.yaml path.key value      Set single encrypted key and value")
+        print("  ansible-vault-yaml -i -e file.yaml path.key value   …then replace file by adding -i")
+        print("  ansible-vault-yaml -D file.yaml path.key            Delete key ")
+        print("  ansible-vault-yaml -R newkey file.yaml              Rekey with newkey (and preview)")
+        print("  ansible-vault-yaml -i --rekey newkey file.yaml      …then replace file")
+        print("  ansible-vault-yaml -d -p newkey file.yaml           …then check file (decrypting everything)")
+        print("  ansible-vault-yaml file.yaml                        …then check file (should show !vault again)")
+        
+        print("")
+        print("notes:")
+        print("  pathes like my.key.list[0] are possible. we use ruamel (not pyaml) to ensure integrity of original content.")
+        print("  you can use '-' for /dev/stdin")
+        print("  if you don't think a shared secret is sufficient use Mozilla SOPS (https://github.com/mozilla/sops)")
+        print("")
+        
+    
+    def __init__(self):
+        self.parser = argparse.ArgumentParser(description='Edit Ansible Vault YAML tags', add_help=False)
+        self.parser.add_argument('-d', '--decrypt', dest='decrypt', action='store_true', help='Decrypt the value (default)')
+        self.parser.add_argument('-D', '--delete', dest='delete', action='store_true', help='delete a key')
+        self.parser.add_argument('--rekey', dest='rekey',  action='store_true', help='Rekey with new key')
+        self.parser.add_argument('-e', '--encrypt', dest='encrypt', action='store_true', help='Encrypt the value')
+        self.parser.add_argument('-k', '--commit', dest='commit', action='store_true', help='Commit changes and update file')
+        self.parser.add_argument('-y', '--diff', dest='diff', action='store_true', help='Use YAML diff to show differences')
+        self.parser.add_argument('-c', '--continue', dest='continue_on_errors', action='store_true', help='Continue on errors')
+        self.parser.add_argument('-p', '--password', dest='vault_pass', type=str, help='Password (preferer using ANSIBLE_VAULT_PASSWORD or ANSIBLE_VAULT_PASSWORD_FILE)')
+        self.parser.add_argument('-i', '--vault-id', dest='vault_id', type=str, help='Which vault ID to use')         
+        self.parser.add_argument('-P', '--rekey-password', dest='rekey_vault_pass', type=str, help='Password for ReKey (preferer using ANSIBLE_VAULT_REKEY_PASSWORD)')
+        self.parser.add_argument('-h', '--help', dest='help', action='store_true', help='Show this help message and exit')
+        self.parser.add_argument('file', nargs='?', help='YAML File')
+        self.parser.add_argument('path', nargs='?', help='Affected YAML Path')
+        self.parser.add_argument('value', nargs='?', help='Value to set')
+
+    def encrypt_all_strings(self, d):
+        i = enumerate(d) if isinstance(d, CommentedSeq) else d.items()
+        for k,v in i:  
+            # print(">", k, type(v))
+            if isinstance(v, OrderedDict):
+                d[k] = self.encrypt_all_strings(v)
+            elif isinstance(v, CommentedSeq):
+                d[k] = self.encrypt_all_strings(v)
+            elif isinstance(v, str):
+                d[k] = self.encrypt(v, self.vault, prefix=f'key {k}: ')
+            elif isinstance(v, VaultString) or isinstance(v, int) or isinstance(v, bool):
+                pass
+            else:
+                raise Exception(f"Unknown {type(v)} for {k}")
+        return d
+
+    def encrypt(self, value, vault, prefix=""):
+        if isinstance(value, VaultString):
+            print(prefix+ "already encrypted", file=sys.stderr)
+            if not self.args.continue_on_errors:
+                sys.exit(1)
+        return VaultString(vault.encrypt(str(value), vault_id='devy', salt="123").decode('utf8'), vault)
+
+    def vault_string_constructor(self, loader, node):
+        
+        vault = self.vault
+        if self.args.rekey:
+            # print('Enter your name:')
+            # x = input()
+            value = self.vault.decrypt(node.value).decode('utf8')
+            value = self.encrypt(value, self.rekey_vault)
+            node.value = value
+            vault = self.rekey_vault
+        return VaultString(loader.construct_scalar(node), vault)
+
+    def vault_string_representer(self, representer, data):
+        # decrypted
+        if self.args.decrypt:
+            return representer.represent_str(str(data.decrypt().decode('utf-8')))
+        # encrypted (plain)
+        return representer.represent_scalar(u'!vault', str(data), style='|')
+
+    def replace_in_place(self):
+        if not pathlib.Path(self.args.file).is_file() or not self.file_exists:
+            print(f"file {'/dev/stdin' if self.args.file=='-' else self.args.file}: using non-block device and trying to replace a file?", file=sys.stderr)
+            sys.exit(1)
+        self.args.decrypt = False
+        buf = io.BytesIO()
+        self.yaml.dump(self.yaml_data, buf)
+        f = open(self.args.file, "wb")
+        f.write(buf.getbuffer())
+        f.close()
+        print(f"file {self.args.file}: updated", file=sys.stderr)
+
+    def check_path_exists(self, path):
+        if not path in self.yaml_accessor:
+            print(f"path {path}: does not exist", file=sys.stderr)
+            if not self.args.continue_on_errors:
+                sys.exit(1)
+
+    def run(self):
+        self.args = self.parser.parse_args()
+        if not self.args.file or self.args.help:
+            self.usage()
+            sys.exit(0)
+
+        # initialize vault 
+
+        vault_pass = ''.encode('utf8')
+        if self.args.vault_pass:
+            vault_pass = self.args.vault_pass.encode('utf8')
+        elif 'ANSIBLE_VAULT_PASSWORD_FILE' in os.environ:
+          with open(os.environ.get('ANSIBLE_VAULT_PASSWORD_FILE'), 'r') as password_file:
+              vault_pass = password_file.read().strip().encode('utf8')      
+        elif 'ANSIBLE_VAULT_PASSWORD' in os.environ:
+          vault_pass = os.environ.get('ANSIBLE_VAULT_PASSWORD').strip().encode('utf8')
+
+        # force getting password if decrypt or encrypt
+        if (self.args.decrypt or self.args.encrypt) and not vault_pass:
+            vault_pass = getpass(prompt="Enter Vault Password: ", stream=sys.stderr).encode('utf8')
+
+        rekey_vault_pass = ''.encode('utf8')
+        if self.args.rekey_vault_pass:
+            rekey_vault_pass = self.args.rekey_vault_pass.encode('utf8')
+        elif 'ANSIBLE_REKEY_VAULT_PASSWORD' in os.environ:
+          rekey_vault_pass = os.environ.get('ANSIBLE_REKEY_VAULT_PASSWORD').strip().encode('utf8')
+
+        # vault will be initialized even with empty password
+        self.vault = VaultLib([(DEFAULT_VAULT_ID_MATCH, VaultSecret(vault_pass))])
+
+        # initialize rekey vault 
+        if self.args.rekey:
+            if not rekey_vault_pass:
+                rekey_vault_pass = getpass(prompt="Enter New Password: ", stream=sys.stderr).encode('utf8')    
+            self.rekey_vault = VaultLib([(DEFAULT_VAULT_ID_MATCH, VaultSecret(self.args.rekey.encode('utf8')))])
+
+        if self.args.file == '-':
+            self.original_content = sys.stdin.read()          
+        elif self.args.file:
+            if not pathlib.Path(self.args.file).is_file():
+                print(f"file {self.args.file}: does not exist", file=sys.stderr)
+                sys.exit(1)
+            with open(self.args.file, "r") as f:
+                self.original_content = f.read()
+                self.file_exists=True
+        
+        self.yaml = ruamel.yaml.YAML(pure=True)
+        self.yaml.constructor.add_constructor(u'!vault', self.vault_string_constructor)
+        self.yaml.representer.add_representer(VaultString, self.vault_string_representer)
+        self.yaml_data = self.yaml.load(self.original_content)
+        self.yaml_accessor = benedict(self.yaml_data)
+
+        # after loading set rekey vault
+        if self.args.rekey:
+            self.vault = self.rekey_vault
+        
+        if self.args.encrypt and not self.args.path and not self.args.value:
+            print("---")
+            self.encrypt_all_strings(self.yaml_data)
+
+        if self.args.path and self.args.delete:
+            if self.args.value:
+                print(f"path {self.args.path}: delete but value specified?", file=sys.stderr)
+                sys.exit(2)
+            if not self.args.path in self.yaml_accessor:
+                print(f"path {self.args.path}: does not exist. nothing to do.", file=sys.stderr)
+                sys.exit(0)
+            del self.yaml_accessor[self.args.path]
+        elif self.args.path and self.args.value:
+            # self.check_path_exists(self.args.path)
+            if self.args.decrypt:
+                print(f"path {self.args.path}: decrypt but setting value?", file=sys.stderr)
+                sys.exit(1)            
+            if self.args.encrypt:
+                self.yaml_accessor[self.args.path] = self.encrypt(str(self.args.value), self.vault, prefix=f"path {self.args.path}: ")
+            else:
+                self.yaml_accessor[self.args.path] = self.args.value
+        elif self.args.path and not self.args.value:
+            self.check_path_exists(self.args.path)
+            value = self.yaml_accessor[self.args.path]
+            if self.args.encrypt:
+                # print(f"path {self.args.path}: encrypt but no value?", file=sys.stderr)
+                # TODO encrypt all values
+                if not self.args.path in self.yaml_accessor:
+                    print(f"path {self.args.path}: does not exist", file=sys.stderr)
+                    sys.exit(1)
+                value = self.yaml_accessor[self.args.path]
+                if isinstance(value, VaultString):
+                    print(f"path {self.args.path}: already encrypted", file=sys.stderr)                    
+                    sys.exit(1)
+                if not isinstance(value, str):
+                    print(f"path {self.args.path}: encrypt but not a str value!", file=sys.stderr)                    
+                    sys.exit(1)
+                self.yaml_accessor[self.args.path] = self.encrypt(str(value), self.vault, prefix=f"path {self.args.path}:")
+            if self.args.decrypt:
+                if callable(value) and hasattr(value, 'decrypt'):
+                    value = str(value.decrypt().decode('utf-8'))
+                else:
+                    print(f"path {self.args.path}: nothing to decrypt (unencrypted value)", file=sys.stderr)
+                print(value, file=sys.stdout)
+                sys.exit(0)
+
+        if self.args.commit:
+            self.replace_in_place()
+            sys.exit(0)
+
+        self.dump()
+
+        if not self.args.commit:
+            print("---", file=sys.stderr)
+            print("# Changes not committed. Use '--commit' or '-k'!", file=sys.stderr)
+        #buf = io.BytesIO()
+        #self.yaml.dump(self.yaml_data, buf)
+        #f = open(self.args.file, "wb")
+        #f.write(buf.getbuffer())
+        # self.yaml.dump(self.yaml_data, sys.stdout)
+        # diff_yaml_streams
+
+
+    def dump(self):
+        try:
+            self.yaml.dump(self.yaml_data, sys.stdout)
+        except Exception as e:
+            print(e, file=sys.stderr)
+            print("Decoding failed", file=sys.stderr)
+            # print(self.original_content)
+            sys.exit(1)
+
+app = App()
+app.run()
+

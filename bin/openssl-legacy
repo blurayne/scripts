@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+export OPENSSL_CONF="$(mktemp)"
+
+cat <<-EOM > $OPENSSL_CONF
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+Options = UnsafeLegacyRenegotiation
+EOM
+
+trap "rm -f $OPENSSL_CONF" EXIT INT QUIT
+
+# openssl s_client  -connect www.google.com:443
+# openssl s_client  -connect 209.242.88.17:443 -servername zeug
+command openssl "$@"
+

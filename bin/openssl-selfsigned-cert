@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+TMP="$(mktemp -d)"
+OPENSSL_CONFIG=
+CA_CRT=""
+CA_KEY=""
+DEBUG=0
+COLORIZE=-1
+COMMAND=
+CERT_NAME=
+CERT_PATH=
+DAYS=360000
+SUBJECT=
+BASENAME="${0##*/}"
+SUBJECT_BASE=/C=US/ST=Michigan/L=Chicago/O=Music/OU=House
+CLEAN=0
+
+function debug {
+  if [[ "$DEBUG" -eq 0 ]]; then
+ 		return
+  fi
+  local tmpl="%s\n"
+  if [[ "$COLORIZE" -eq 1 ]]; then
+			tmpl="\e[1m\e[31m\e[38;2;255;0;255m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${*?message}" >&2
+
+}
+
+
+function err {
+	local tmpl="%s\n"
+	if [[ "$COLORIZE" -eq 1 ]]; then
+			tmpl="\e[1m\e[31m\e[38;2;212;64;64m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+
+function warn {
+	local tmpl="%s\n"
+	if [[ "$COLORIZE" -eq 1 ]]; then
+			tmpl="\e[3m\x1b[38;2;255;100;0m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+
+function info {
+	local tmpl="%s\n"
+	if [[ "$COLORIZE" -eq 1 ]]; then
+			tmpl="\e[1m\e[35m\x1b[38;2;255;192;64m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+
+function label {
+    local len="${2:-1}"
+  	local tmpl="%-${len}s"
+		if [[ "$COLORIZE" -eq 1 ]]; then
+				tmpl="\e[37m\e[1m\x1b[38;2;255;255;255m%-${len}s\x1b[0m"
+  	fi
+  	printf "$tmpl" "${1?label}" >&2
+}
+
+
+function notice {
+	local tmpl="%s\n"
+	if [[ "$COLORIZE" -eq 1 ]]; then
+			tmpl="\e[37m\x1b[38;2;128;128;164m%s\x1b[0m\n"
+  fi
+  printf "$tmpl" "${1?message}" >&2
+}
+
+
+function raise-error() {
+	local message="${1?error-message}"
+	local exit_code="${2:-1}"
+	err "$BASENAME: $message"
+	exit "$exit_code"
+}
+
+
+function openssl-config {
+	cat <<-EOM
+		[default]
+		authorityKeyIdentifier=keyid,issuer
+		basicConstraints=CA:FALSE
+		keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+		subjectAltName = @alt_names
+
+		[alt_names]
+		DNS.0 = *
+		IP.0 = 0.0.0.0
+	EOM
+}
+
+function generate-openssl-config {
+	OPENSSL_CONFIG="$TMP/openssl.conf"
+	openssl-config > "$OPENSSL_CONFIG"
+}
+
+function check-existent-certs {
+	local basepath="${1?basepath}"
+	local file
+	local files+=()
+	for file in "$basepath" "$basepath.key" "$basepath.crt" "$basepath.pem" "$basepath.cert"; do
+		if [[ -e "$file" ]]; then files+=("$file"); fi
+	done
+	if [[ "${#files[@]}" -gt 0 ]]; then
+		
+		if [[ "$CLEAN" -eq 1 ]]; then
+			warn "Removing Files"
+			for file in "${files[@]}"; do
+				rm "$file" && warn "$file" >&2
+			done
+			return
+		fi	
+		err "Existing Files"
+		for file in "${files[@]}"; do
+			err "$file"	
+		done
+		return 1
+	fi
+	return 0
+}
+
+function generate-ca {
+	if [[ -z "$CERT_NAME" ]]; then
+		CERT_NAME=ca
+	fi
+
+	check-existent-certs "$CERT_PATH/$CERT_NAME"
+
+	if [[ -z "$SUBJECT" ]]; then
+		SUBJECT="$SUBJECT_BASE/CN=$CERT_NAME"
+	fi	
+	
+	info "CA key (KEY)"
+	openssl genrsa -out "$CERT_PATH/$CERT_NAME.key" 4096 >&2
+	echo "${CERT_PATH}/${CERT_NAME}.key"
+	CA_KEY="$CERT_PATH/ca.key"
+
+	info "Self-signed CA Cert (CRT)"
+	openssl req -x509 -new -nodes -key "$CERT_PATH/$CERT_NAME.key" -sha256 -subj "$SUBJECT" -days "$DAYS" -out "$CERT_PATH/$CERT_NAME.crt" >&2
+	echo "${CERT_PATH}/${CERT_NAME}.crt"
+	CA_CRT="$CERT_PATH/ca.crt"
+
+	info "Certificate Info"
+	ssl-cert-info "${CERT_PATH}/${CERT_NAME}.crt" >&2
+}
+
+
+function ssl-cert-info {
+	local file="${1?filename}"
+	openssl x509 -in $file -fingerprint -subject -serial -dates -issuer -noout   
+}
+
+function generate-client-cert {
+	if [[ -z "$CERT_NAME" ]]; then
+		CERT_NAME=client
+	fi
+
+	check-existent-certs "$CERT_PATH/$CERT_NAME"
+
+	if [[ -z "$SUBJECT" ]]; then
+		SUBJECT="$SUBJECT_BASE/CN=$CERT_NAME"
+	fi
+
+	info "Client key (KEY)"
+	openssl genrsa -out "${CERT_PATH}/${CERT_NAME}.key" 4096 >&2
+	echo "${CERT_PATH}/${CERT_NAME}.key"
+	info "Client Cert Signing Request (CSR)"
+	openssl req -new -sha256 -key "${CERT_PATH}/${CERT_NAME}.key" -subj "${SUBJECT}" -out "${CERT_PATH}/${CERT_NAME}.csr" >&2
+	echo "${CERT_PATH}/${CERT_NAME}.csr"
+	# info "Review Cert Signing Request"
+	# openssl req -in "${CERT_PATH}/${CERT_NAME}.csr" -noout -text
+	info "Client Cert with Signing by CA"
+	openssl x509 -extfile "$OPENSSL_CONFIG" -req -in "$CERT_PATH/$CERT_NAME.csr" -CA "$CA_CRT" -CAkey "$CA_KEY" -CAcreateserial -out "$CERT_PATH/$CERT_NAME.crt" -days "$DAYS" -sha256 >&2
+	echo "${CERT_PATH}/${CERT_NAME}.crt"
+	info "Certificate Info"
+	ssl-cert-info "${CERT_PATH}/${CERT_NAME}.crt" >&2
+	# info "Review Cert"
+	# openssl x509 -in "${CERT_PATH}/${CERT_NAME}.crt" -text -noout
+	info "Client Bundle (PEM)"
+	cat "${CERT_PATH}/${CERT_NAME}.key" "${CERT_PATH}/${CERT_NAME}.crt" > "${CERT_PATH}/${CERT_NAME}.pem"
+	echo "${CERT_PATH}/${CERT_NAME}.pem"
+}
+
+
+function usage {
+	cat <<-EOM
+		USAGE 
+		  $BASENAME COMMAND [options]
+
+		COMMANDS 
+
+		  generate-ca
+				
+		  generate-client-cert
+
+		    -ca   FILE    Path to CA certificate (defaults to 'ca.crt')
+		    -key  FILE    Path to CA key (defaults to 'ca.key')
+		    
+		OPTIONS
+
+		  -n, -name     Name of the certificate to generate (optional, default 'ca' or 'client')
+		  -p, -path     Certificate storage
+		  -s, -subject  Certificate subject
+		  -c, -clean    Clean files before creating
+
+		SUBJECT
+		
+		  Auto-generated by '$SUBJECT_BASE/CN=\$CERT_NAME'
+
+	EOM
+}
+
+function init {
+	while [[ "$#" -gt 0 ]]; do 
+		arg="$1"
+		shift
+		case "$arg" in
+
+			-h|--help|help)
+				usage
+				exit 0
+				;;
+
+			-c|--clean)
+				CLEAN=1
+				;;
+
+			# ca crt file
+			-ca)
+				opt="${1?ca}"
+				shift
+				CA_CRT="$opt"
+				;;
+
+			# subject
+			-subject)
+				opt="${1?subject}"
+				shift
+				SUBJECT="$opt"
+				;;
+
+			# ca key file
+			-key)
+				opt="${1?ca}"
+				shift
+				CA_KEY="$opt"
+				;;
+
+			# name of the client certificate
+			-name|-n)
+				opt="${1?name}"
+				shift
+				CERT_NAME="$opt"
+				;;
+
+			-path|-p)
+				opt="${1?name}"
+				shift
+				CERT_PATH="$opt"
+				;;
+
+			generate-client-cert|generate-ca)
+				COMMAND="$arg"
+				;;
+
+			*)
+				raise-error "unknown arg: $arg"
+		esac
+	done
+	
+	if  [[ "$COLORIZE" -eq -1 ]] && [[ -t 1 ]]; then
+		COLORIZE=1
+	fi
+
+	if [[ -z "$COMMAND" ]]; then
+		usage
+		exit 1
+	fi
+
+
+	# automatically find key
+	if [[ -n "$CA_CRT" ]] && [[ -z "$CA_KEY" ]]; then
+		CA_KEY="${CA_CRT%.*}.key"
+	fi
+	
+	# automatically find cert
+	if [[ -n "$CA_KEY" ]] && [[ -z "$CA_CRT" ]]; then
+		CA_CRT="${CA_CRT%.*}.crt"
+	fi
+	
+	if  [[ -n "$CA_KEY" ]] && [[ ! -r "$CA_CRT" ]]; then
+		raise-error "$CA_CRT is not readable!"
+	fi 
+
+	if  [[ -n "$CA_KEY" ]] && [[ ! -r "$CA_KEY" ]]; then
+		raise-error "$CA_KEY is not readable!"
+	fi 
+
+	if [[ -z "$CERT_PATH" ]]; then
+		CERT_PATH="."
+	fi
+
+	if  [[ -z "$CA_KEY" ]]; then
+		CA_KEY="$CERT_PATH/ca.key"
+	fi
+
+	if  [[ -z "$CA_CRT" ]]; then
+		CA_CRT="$CERT_PATH/ca.crt"
+	fi
+
+
+}
+
+
+function main {
+	init "$@"
+	generate-openssl-config
+	case "$COMMAND" in
+		generate-ca) generate-ca;;
+		generate-client-cert) generate-client-cert;;
+	esac
+}
+
+
+main "$@"
