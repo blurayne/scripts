@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+
+
+set -eEuo pipefail
+
+
+## 
+# "find in reverse"
+# 
+# wrapper for find or bfs adding '-reverse' option
+# 
+# shall not support mindepth anymore!
+
+function find-cmd-in-pathes() {
+	local cmd="${1}"
+	local rc=1
+	while read -r p; do 
+		PATH="$p" command -v "$cmd" && rc=0
+	done < <(echo "${PATH//:/$'\n'}")
+ 	# find $(echo ${PATH//:/$'\n'}) -name find
+ 	return $rc
+}	
+
+function find-underlying-cmd {
+	local cmd="${1=cmd}"
+	# fullpath="$(readlink -f $(command -v "$cmd"))"
+	fullpath="$(readlink -f "$0")"
+	while read -r c; do
+		if [[ "$fullpath" != "$(readlink -f "$c")" ]]; then
+			printf "%s" "$c"
+			return 0
+		fi
+	done < <(find-cmd-in-pathes "$cmd")
+
+	return 1
+}
+
+function main() {
+	local p=""
+	local tmp_cnt="$(mktemp)"
+	local cmd="find"
+	local reverse=0
+	local args=()
+	local org_args=()
+	# symlink for find or bfs
+
+	# get-cmd-from-script {
+	# assign script name
+	cmd="${0##*/}"
+	# if we match cmd names like find-in-reverse or find-reverse
+	if [[ "$cmd" =~ ^(find|bfs)- ]]; then
+		cmd="${cmd%%-*}"
+		if [[ ! -x $(readlink -f "$cmd" || true) ]]; then
+			echo "could not find wrapped command for '$cmd'" >&2
+			exit 1
+		fi
+		reverse=1
+	fi
+	
+	cmd="$(find-underlying-cmd "$cmd" || true)"
+	if [[ ! -x "$cmd" ]]; then
+		echo "could not find underlying command for '$cmd'" >&2
+		exit 1
+	fi	
+
+	# parse args
+	while [[ $# -gt 0 ]]; do
+		arg="$1"
+		org_args+=("$arg")
+		shift 1
+		case "$arg" in
+			# nullify
+			-mindepth|-maxdepth)
+				shift 1
+				;;
+			-reverse)
+				reverse=1
+				;;
+			*)
+				args+=("$arg");;
+		esac
+	done
+
+	if [[ "$reverse" -eq 0 ]]; then
+		exec "$cmd" "${org_args[@]}" && return 0
+	fi
+	
+	p="$(pwd)"
+	rc=0
+	while :; do
+		"$cmd" "$p/" -mindepth 1 -maxdepth 1 "${args[@]}" || rc=$?
+		if [[ "${p}/" == "/" ]]; then
+			break
+		fi
+		p="${p%/*}"
+	done
+	return $rc
+}
+
+main "$@"
+

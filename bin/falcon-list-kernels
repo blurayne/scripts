@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+FILE="${1:-/opt/CrowdStrike/KernelModuleArchive}"
+
+if [[ ! -r "$FILE" ]];  then
+    >&2 echo "${0##*/}: ${FILE} is not readable!" && exit 1
+fi
+
+cat "$FILE" \
+    | xz --decompress \
+    | grep -bUoaP "(distro|description|vermagic|license)=[\x20-\x7e]+" \
+    | awk -F : '
+        BEGIN { offset=0 } 
+        END { show=1 } 
+        // {
+            lastoffset=offset;
+            offset=$1;
+            if (offset-2000>lastoffset) { show=1 };
+            if (show) {
+                print c["description"] " " c["distro"] "-"  c["vermagic"] "(" c["license"] ")"; 
+                show=0 
+            };
+            split($2, a, "="); 
+            k=a[1]; 
+            v=a[2]; 
+            c[k]=v  
+        }'
+
+         

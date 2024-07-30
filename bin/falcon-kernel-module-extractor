@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+
+import struct
+import sys
+import re
+from pprint import pprint
+import binascii
+import hashlib
+import lzma
+import argparse
+import os
+import json
+import pwd
+from pprint import pprint
+from io import BytesIO
+from elftools.elf.elffile import ELFFile
+from elftools.elf.elffile import ELFFile
+from elftools.elf.sections import StringTableSection
+
+
+
+LZMA_SIG = b'\xfd7zXZ\x00'
+ELF_SIG  = b'\x7fELF'
+END_SIG = b'~Module signature appended~'
+# https://terenceli.github.io/%E6%8A%80%E6%9C%AF/2018/06/02/linux-loadable-module
+
+#  cat <(grep -bUoaP "\x7fELF"  blob ) <(grep -bUoaP "~Module signature appended~" blob) | sort -n | less   
+# grep -bUoaP "depends=[\x20-\x7e]+"  blob   
+# grep -bUoaP "[a-z]{4,}=[\x20-\x7e]+"  blob 
+# objdump -s -j .modinfo falcon-sensor-amzn1-4.14.225-121.357.amzn1.x86_64.kal.ko
+# meld <(objdump -S falcon-sensor-ubuntu22-5.15.0-53-generic.kal.ko) <(objdump -S falcon-sensor-ubuntu22-5.15.0-50-generic.kal.ko) 
+
+
+class App:
+
+    modulearchive='/opt/CrowdStrike/KernelModuleArchive',
+
+    def process_file(f):
+        # print('Processing file:', filename)
+        # with open(filename, 'rb') as f:
+            # tag = section.get_tag('.modinfo')
+        elf = ELFFile(f)
+        modinfo = elf.get_section_by_name('.modinfo')
+        pprint([i.decode('ASCII').strip() for i in modinfo.data().split(b'\x00') if len(i)>0])
+
+
+    def main(self):
+
+        
+        parser = argparse.ArgumentParser()
+        parser.add_argument('-s', '--verstr', dest="version", nargs=1, help='version')
+        parser.add_argument('-d', '--distro',  dest="distro", nargs=1, help='distro')
+        parser.add_argument('-r', '--regex', dest="filter", nargs=1, help='regex filter for filename')
+        parser.add_argument('-f', '--modulearchive', dest="modulearchive", help='kernel module archive',default="/opt/CrowdStrike/KernelModuleArchive")
+        # parser.print_help()
+        self.args = parser.parse_args()
+
+        if not os.access(self.args.modulearchive, os.R_OK):
+            # If the file cannot be read by the current user, elevate user permissions by exec
+            print("Current user does not have read permission on the file. Elevating user permissions...")
+            sys.exit(os.execvp('sudo', ['sudo', '-p', '', sys.executable] + sys.argv))
+
+        
+        # print(pwd.getpwuid(os.getuid())[0])
+
+        with open(self.args.modulearchive, 'rb') as f:
+            sig = f.read(6)
+
+        if sig == b'\xfd7zXZ\x00':
+            sys.stderr.write(f"Decompressing LZMA module archive at {self.args.modulearchive}\n")
+            # If the file is an xz archive, open it as an lzma stream
+            with lzma.open(self.args.modulearchive, 'rb') as f:
+                data = f.read()
+        else:
+            sys.stderr.write(f"Loading module archive at {self.args.modulearchive}\n")
+            with open(self.args.modulearchive, 'rb') as f:
+                data = f.read()
+
+        #  grep -bUoaP "~Module signature appended~\x0A"  blob        
+        # 1200307030:~Module signature appended~
+
+        #first_module_end = data.find(END_SIG)
+        #if first_module_end == -1:
+        #    sys.stderr.write(f"No modules found!\n")
+        #    sys.exit(1)
+        # go back to start
+        #start_offset = data.rfind(ELF_SIG, 0, first_module_end-1)
+        
+        start_offset = 0
+        sys.stderr.write(f"Starting at offset {start_offset}\n")
+        current_offset = start_offset
+        while start_offset < len(data):
+            current_offset = data.find(ELF_SIG, start_offset)
+            if current_offset == -1:
+                sys.stderr.write(f"No more modules found!\n")
+                sys.exit(0)            
+
+            try:
+                elf = ELFFile(BytesIO(data[current_offset:current_offset+1024]))
+
+                module_size = elf.header['e_shoff'] + (elf.header['e_shentsize'] * elf.header['e_shnum']) 
+                module_data = data[current_offset:current_offset+module_size]
+
+                sys.stderr.write(f" found ELF offset:{current_offset} size:{module_size}\n")
+                
+                #print(f"{module_data[0:5]}")
+
+                module_file = BytesIO(module_data)
+                elf = ELFFile(module_file) 
+                
+
+                # sys.stdout.write(f"size {module_size}\n")
+                modinfo = elf.get_section_by_name('.modinfo')
+                modinfo_lines = [i.decode('ASCII').strip() for i in modinfo.data().split(b'\x00') if len(i)>0]
+
+
+                modinfo_vars = {}                
+                for item in modinfo_lines:
+                    k, v = item.split("=")
+                    modinfo_vars[k]=v
+
+                version = (modinfo_vars['vermagic'].split(' ')[0]).replace('CSVERMAGIC','').lower()
+                desc =  modinfo_vars['description'].lower()
+
+                sys.stdout.write(json.dumps(modinfo_vars))
+                
+                if 'name' in modinfo_vars:
+                    name =  modinfo_vars['name']
+                else:
+                    if "crowdstrike kal module" in desc:
+                        name = 'falcon_kal'
+                    elif "crowdstrike pinned security module" in desc:
+                        name = 'falcon_lsm_pinned_14712'
+                    elif "crowdstrike network containment security module" in desc:
+                        name = 'falcon_nf_netcontain'
+                    elif "crowdstrike serviceable security module" in desc:
+                        name = 'falcon_lsm_serviceable'                
+                    else:
+                        sys.stderr.write(f"Unknown module type: {desc}\n")
+                        sys.exit(1)
+
+                # filename = f"{modinfo_vars['distro']}/lib/modules/{version}/{name}.ko"
+
+                filename = f"{modinfo_vars['distro']}/{version}/{name}.ko"                
+
+                # filename = f"{name}-{modinfo_vars['distro']}-{version}.ko"
+
+                # sys.stdout.write(f"{filename}\n")
+
+                #with open(filename, "wb") as module_file:
+                #    module_file.write(module_data)
+                # CrowdStrike KAL Module
+                
+            except Exception as e:
+                pprint(e, out=sys.stderr)
+                pass
+
+            start_offset = current_offset + module_size
+
+            # sys.stdout.write(f'found offset:{current_offset} size:{end_offset-current_offset}\n')
+
+
+if __name__ == '__main__':
+    app = App()
+    app.main()
+
+
+

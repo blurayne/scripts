@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+
+import struct
+import sys
+import re
+from pprint import pprint
+import binascii
+import hashlib
+import lzma
+
+#import mmap
+
+##with open("hugefile", "rw+b") as f:
+#    mm = mmap.mmap(f.fileno(), 0)
+#    print mm.find('\x00\x09\x03\x03')
+
+
+# NOTE: don't forget to sign modules if loading into a kenrel and secure boot is on!
+# sudo /etc/dkms/sign_helper.sh "$(uname -r)" module
+signatures = [
+    0x464c457f,    
+    0xfeedface,
+    0x016F2818,
+    0x272f3d4c,
+    0x534d4150,
+    0x1b838810,
+    0x454c46, # ELF
+]
+signatures = [struct.pack('<I', sig) for sig in signatures]
+# pprint(signatures)
+
+# sys.exit(0)
+def find_sig(data, offset):
+    global signatures
+    pprint(signatures)
+    for sig in signatures:
+        start_offset = data.find(sig, offset)
+        if start_offset != -1:
+            return (sig, start_offset)
+
+def get_filename(string):
+    index_of_first_space = string.find(" ")
+    if index_of_first_space == -1:
+        return string
+    else:
+        return string[:index_of_first_space]
+
+def extract_kernel_module(file_path):
+    print(f"Decompressing {file_path}")    
+    with lzma.open(file_path) as f:
+        data = f.read()
+
+
+    print(f"Scanning headers")    
+    total = len(data)
+    # first_data = data[0:int(total/4)]
+    first_data = data[0:data.find(struct.pack('<I',0x454c46))]
+    #first_data = data[0:2000000]
+
+    # Use regular expressions to search for the Linux version string
+    x = re.compile(b'(.{8}).([a-z0-9]{4,})\x2E(\d+.\d+.\d+[\x20-\x7e][\x20-\x7e]{3,})(\x20|\xEC\x04\xFD\x04\x0C   )')
+    strings = re.findall(x, first_data)
+    # pprint(strings)
+
+    kernels = {}
+    s = []
+    for els in strings:
+        id = els[1].decode('UTF-8')
+        offset = struct.unpack('II', els[0])
+        if offset[0] > total:
+            continue
+            print("BANG!")
+            sys.exit(1)
+
+        # m= offset[1] - offset[0]
+        if id == "vermagic":
+            continue
+        v = els[2].decode('UTF-8')
+        if id not in kernels:
+            kernels[id] = []
+        kernels[id].append([v])
+        s.append([f"{id}-{v}-{offset}"])
+        magic = binascii.hexlify(data[offset[0]:offset[0]+4])
+        size = offset[1]-offset[0]
+        print(f"{id}-{v}-{magic}-{size}")
+
+    print(f"Scanning for kernel modules")    
+    start_offset = 0
+    total = len(data)
+    chunk_count = 0
+    ssig = "description=".encode('ASCII')
+    while start_offset < total:
+        (sig, start_offset) = find_sig(data, start_offset)
+        if not start_offset:
+            print("no start sig found anymore")
+            sys.exit(0)
+        module_size = 0
+        sys.stderr.write(f"\rScanning ({(100/total*start_offset):02.2f}%) ")
+
+        # find the next signature or the end of the file
+
+        end_offset = data.find("~Module signature appended~".encode(), start_offset)
+        print(f"{start_offset}:{end_offset}")
+        if end_offset == -1:
+            print("ending")
+            sys.exit(0)
+
+        module_data = data[start_offset:end_offset]    
+        module_size = len(module_data)
+        start_offset = end_offset
+        # module_size = len(data) - start_offset
+
+        #for i in range(start_offset + 4, len(data) - 3):
+       #     if data[i:i+4] in signatures:
+       #         module_size = i - start_offset
+       #         break
+    
+        #if module_size == 0:
+        #    module_size = len(data) - start_offset        
+            
+        
+        info_offset = module_data.find(ssig)
+        if info_offset == -1:
+            chunk_count += 1
+            module_name = f"chunk-{chunk_count}.elf"
+            with open(module_name, "wb") as module_file:
+                module_file.write(module_data)
+            print(f"no kernel module found in chunk, filename={module_name} offset={start_offset} len={len(module_data)}")
+            continue
+        info_data=module_data[info_offset:info_offset+(1024*4)]
+        distro = re.findall(b'distro=([\x20-\x7e]+)', info_data)
+        vermagic = re.findall(b'vermagic=([\x20-\x7e]+)', info_data)
+        license = re.findall(b'license=([\x20-\x7e]+)', info_data)
+        description = re.findall(b'description=([\x20-\x7e]+)', info_data)
+
+
+
+        if not vermagic or not distro or not license:
+            print(f"no kernel module info found, offset={start_offset} len={len(module_data)}")
+            continue
+        vermagic = vermagic[0].decode('UTF-8')
+        distro = distro[0].decode('UTF-8')
+        license = license[0].decode('UTF-8')
+        description = description[0].decode('UTF-8')
+        module_name = f'falcon-sensor-{distro}-{get_filename(vermagic)}.ko'
+        module_name = module_name.replace('CSVERMAGIC', '')
+
+        #with open(module_name, "wb") as module_file:
+        #    module_file.write(module_data)
+        print(f"found kernel module, filename={module_name} vermagic={vermagic.encode()} sig=0x{binascii.hexlify(sig).decode()} offset={start_offset} len={len(module_data)} license={license} description={description}")
+
+extract_kernel_module("/opt/CrowdStrike/KernelModuleArchive14712")

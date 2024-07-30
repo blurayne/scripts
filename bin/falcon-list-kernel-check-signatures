@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+printf $(sudo grep -oP 'kernels="\K.+' /opt/CrowdStrike/falcon-kernel-check) 
+
