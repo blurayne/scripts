@@ -29,7 +29,6 @@ function debug {
 
 }
 
-
 function err {
 	local tmpl="%s\n"
 	if [[ "$COLORIZE" -eq 1 ]]; then
@@ -218,6 +217,7 @@ function usage {
 
 	EOM
 }
+
 
 function init {
 	while [[ "$#" -gt 0 ]]; do 

@@ -414,6 +414,26 @@ function main {
 		echo "Complete pipeline: subl $tmp.yaml"
 		echo "Complete pipeline: zed $tmp.yaml"
 
+		if [[ -n "$job_id" ]]; then
+			echo "Complete job log: less $tmp.log"
+			(
+					curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$project_id/jobs/$job_id/trace" \
+						| sed 's|\x0d|\n|g;s/^\x1b.\x30\x3bmsection|section//g;' \
+						| sed -r 's/(^section.+)/\x1b[35m\1\x1b[0m/' \
+						 > "$tmp.log"
+					echo >&2
+					info "Head of log"
+					echo >&2
+					cat "$tmp.log" | awk '/Getting source from Git repository/ { exit } { print } '
+					echo >&2
+					info "Timings"
+					echo >&2
+					sed -e 's/\x1b\[[0-9;]*m//g' "$tmp.log" \
+						| awk -F: '/section_start/ { x[$3]=$2 } /section_end/ { print $3 ": " $2 - x[$3] "s"  }'
+					echo
+				)  & disown
+		fi
+
 		echo >&2
 		if [[ "$is_protected_branch" -eq 1 ]]; then
 			warn "You are on a protected branch!"
