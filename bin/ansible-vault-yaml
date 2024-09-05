@@ -57,6 +57,7 @@ examples:
   ansible-vault-yaml -d file.yaml path.key            Decrypt single key
   ansible-vault-yaml file.yaml path.key value         Set single key and value
   ansible-vault-yaml -e file.yaml path.key value      Set single encrypted key and value
+  ansible-vault-yaml -e file.yaml path.key            Enccrypt single key value
   ansible-vault-yaml -i -e file.yaml path.key value   …then replace file by adding -i
   ansible-vault-yaml -D file.yaml path.key            Delete key 
   ansible-vault-yaml -R newkey file.yaml              Rekey with newkey (and preview)
@@ -312,12 +313,13 @@ class App:
                     sys.exit(1)
                 self.yaml_accessor[self.args.path] = self.encrypt(str(value), self.vault, prefix=f"path {self.args.path}:")
             if self.args.decrypt:
-                if callable(value) and hasattr(value, 'decrypt'):
+                value = self.yaml_accessor[self.args.path]
+                if  type(value) not in (str, int, float, bool) and hasattr(value, 'decrypt'):
                     value = str(value.decrypt().decode('utf-8'))
+                    self.yaml_accessor[self.args.path] = value
                 else:
                     print(f"path {self.args.path}: nothing to decrypt (unencrypted value)", file=sys.stderr)
-                print(value, file=sys.stdout)
-                sys.exit(0)
+                    sys.exit(1)
 
         if self.args.commit:
             self.replace_in_place()

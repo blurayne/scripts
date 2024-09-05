@@ -1,0 +1,527 @@
+#!/usr/bin/env bash
+
+## ### https://oblcc.com/blog/configure-openid-connect-for-gitlab-and-aws/
+
+set -eEuo pipefail
+
+SELF="${0}"
+BASENAME="${SELF##*/}"
+
+# https://docs.aws.amazon.com/eks/latest/userguide/enable-iam-roles-for-service-accounts.html
+
+AWS_PROFILE="${AWS_PROFILE}"
+AWS_REGION=""
+AWS_X_ACCOUNT_ID=""
+CLUSTER_NAME=""
+OIDC_PROVIDER_URL=""
+OIDC_ID=""
+JWKS_URI=""
+ROOT_CA=""
+THUMBPRINT=""
+OIDC_PROVIDER_ARN=""
+OPT_CHECK_ONLY=0
+OPT_APPLY=0
+CONTEXT=""
+NAMESPACE="steampipe"
+SA_NAME=""
+K8S_ROLE_NAME=""
+ROLE_NAME=""
+ROLE_ARN=""
+
+# kubectl get sa  -n $NAMESPACE -ojson
+
+# arn:aws:iam::$AWS_X_ACCOUNT:ID:role/$AWS_IAM_ROLE_NAME
+
+
+function err() {
+	printf "\e[1m\e[31m\e[38;2;255;0;0m%s\x1b[0m\n" "${1?message}" >&2
+}
+
+function  warn() {
+	printf "\e[3m\x1b[38;2;255;100;0m%s\x1b[0m\n" "${1?message}" >&2
+}
+
+function  info() {
+	printf "\e[1m\e[35m\x1b[38;2;255;192;64m%s\x1b[0m\n" "${1?message}"
+}
+
+function title  {
+  local title="$1"
+	echo -ne "\e[1m"
+	echo -n "${title}"
+	echo -e "\e[0m"
+}
+
+function raise-err {
+	local msg="${1?message}"
+	local exit_code="${2:-1}"
+	err "$1"
+	exit $exit_code
+}
+
+##
+# compare one version against another
+# param1: version 1
+# param2: operater (like used by test)
+# param3: version 2
+vercomp() {
+	local IFS=.
+	local a=($1) op="$2" b=($3)
+	test $(printf "%d%03d%03d%03d" "${a[@]}") "$op" $(printf "%d%03d%03d%03d" "${b[@]}")
+}
+
+
+## 
+# param1: which binary
+# param2: option or rest of command to get version
+# param3: operator
+# param4: required version
+req-bin() {
+   local bin="$1"
+  local binpath="$(which "$bin" 2>/dev/null )"
+  if [[ -z "$binpath" ]]; then
+    err "req-bin: $bin not found"
+    return 1
+  fi
+  if [[ -z "${2:-}" ]]; then
+    if [[ "$OPT_QUIET" -ne 1 ]]; then "$binpath OK"; fi;
+    return 0
+  fi
+  if [[ "${2:-}" ]]; then
+    local optversion="${2}"
+    local vercomp="${3}"
+    local reqversion="${4}"
+    local version="$(source <(echo -n "$bin $optversion" ) 2>&1 | grep -E -o '([0-9]+)(\.[0-9]+)?(.[0_9]+)?' | head -1)"
+    if [[ -z "$version" ]]; then
+        err "req-bin: could not get version for $binpath"
+        return 1
+    fi
+    if vercomp $version $vercomp $reqversion; then
+        if [[ "$OPT_QUIET" -ne 1 ]]; then echo "$binpath (v$version) OK"; fi;
+        return 0
+    fi
+    err "req-bin: did not find expected version: $binpath $3 $4?"
+    return 1
+  fi
+}
+
+
+# check-service-account
+# check-all
+# --cache use context cache
+# get-info --output json
+
+function parse-args {
+	local opt=""
+  while [[ $# -gt 0 ]]; do
+		arg="$1"
+		shift 1
+		case "$arg" in
+
+			-p|--profile) 
+				export AWS_PROFILE="${1?profile}"
+				shift 1
+				;;
+
+			-c|--context) 
+				export CONTEXT="${1?k8s-context}"
+				shift 1
+				;;
+
+			-n|--namespace) 
+				export NAMESPACE="${1?k8s-namespace}"
+				shift 1
+				;;
+
+			-C|--check) 
+				OPT_CHECK_ONLY=1
+				OPT_APPLY=0
+				;;
+
+			-K|--apply) 
+				OPT_APPLY=1
+				;;
+
+			-sa|--service-account-name) 
+				export SA_NAME="${1?k8s-service-account}"
+				shift 1
+				;;
+
+			--no-k8s-role)
+				;;
+
+			-r|--iam-role|--iam-role-arn) 
+				opt="${1?iam-role}"
+				shift 1
+				if [[ "$opt" == arn* ]]; then
+					ROLE_ARN="${opt}"
+					ROLE_NAME="${opt%/*}"
+				else
+					ROLE_NAME="${opt}"
+				fi
+				;;
+
+			-[a-z]*)
+				set -- $(for ((i=1; i<${#arg}; i++ )); do echo " -${arg:$i:1}"; done) "$@"
+				;;
+
+			# --assume-other-roles -> hint
+
+
+			-*)
+				raise-err "unknown option $arg"
+				exit 1; 
+				;;
+
+			*)
+				raise-err "unknown argument $arg"
+				exit 1; 
+				;;
+		esac
+	done
+
+
+	if [[ -z "$NAMESPACE" ]]; then
+		NAMESPACE="$(kubectl config view --minify -o jsonpath='{..namespace}')"
+	fi
+	if [[ -z "$CONTEXT" ]]; then
+		CONTEXT="$(kubectl config current-context)"
+	fi
+	if [[ -z "$NAMESPACE" ]]; then
+		raise-err "$BASENAME: namespace is required"
+	fi
+	if [[ -z "$CONTEXT" ]]; then
+		raise-err "$BASENAME: context is required"
+	fi
+	if [[ -z "$ROLE_NAME" ]] && [[ -z "$SA_NAME" ]]; then
+		raise-err "$BASENAME: Role Name or Service-Account name is required"
+	fi
+}
+
+
+function collect-env {
+	title "Collecting k8s cluster information:"
+	info "K8s Context: $CONTEXT"
+	read -r K8S_DISTRO AWS_REGION AWS_X_ACCOUNT_ID CLUSTER_NAME	_	\
+		 <<< "$(kubectl config view -ojson | jq -rec --arg context "$CONTEXT" '.contexts[]|select(.name==$context)|.context.cluster|capture("arn:aws:(?<distro>[^:]+):(?<region>[^:]+):(?<account>[^:]+):cluster/(?<cluster>[^/]+)")|[to_entries[].value]|@tsv' )"
+	export AWS_REGION
+	info "K8s Cluster Name: $CLUSTER_NAME"
+	info "K8s Distro: $K8S_DISTRO"
+	info "AWS Region: $AWS_REGION"
+	OIDC_PROVIDER_URL=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --query "cluster.identity.oidc.issuer" --output text)
+	info "Issuer URL: $OIDC_PROVIDER_URL"
+	OIDC_PROVIDER="$(sed -e "s/^https:\/\///"	<<< "$OIDC_PROVIDER_URL")"
+	OIDC_ID="$(cut -d '/' -f 5 <<< "$OIDC_PROVIDER_URL" )"
+	# Ask OIDC Provider for JWKS host (remove schema and path with sed)
+	JWKS_URI=$(curl -sfLS ${OIDC_PROVIDER_URL}/.well-known/openid-configuration | jq -re '.jwks_uri' | sed -e "s/^https:\/\///" | sed 's/\/.*//')
+	info "JWKS URI: $JWKS_URI"
+	TEMP=$(mktemp -d -t oidc-eks-XXXX)
+	openssl s_client -servername $JWKS_URI -showcerts -connect $JWKS_URI:443 < /dev/null 2>/dev/null | awk -v dir="$TEMP" '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/{ if(/BEGIN/){a++}; out=dir"/cert00"a".crt"; print >out }'
+	# Assume last found certificate in chain is the ROOT_CA
+	ROOT_CA=$(ls -1 $TEMP/* | tail -1)
+	# err "- Root CA: $(openssl x509 -in $ROOT_CA -noout -fingerprint)"
+	# openssl x509 -in $ROOT_CA -noout -issuer
+	# openssl x509 -in $ROOT_CA -noout -subject 
+  # Extract fingerprint in desired format (no header, no colons)
+	THUMBPRINT=$(openssl x509 -fingerprint -noout -in $ROOT_CA | sed 's/^.*=//' | sed 's/://g')
+	info "Thumbprint: $THUMBPRINT"
+	rm -rf $TEMP
+}
+
+function init {
+	parse-args "$@"
+	collect-env
+	setup-env
+}
+
+
+function setup-env {
+	if [[ -n "$ROLE_NAME" ]] && [[ -z "$SA_NAME" ]]; then
+		SA_NAME="$(jq -rRe 'camel_to_kebab' <<< "$ROLE_NAME")"
+	fi
+	if [[ -n "$SA_NAME" ]] && [[ -z "$ROLE_NAME" ]]; then
+		ROLE_NAME="eks-sa-$SA_NAME"
+	fi
+	ROLE_ARN="arn:aws:iam::$AWS_X_ACCOUNT_ID:role/$ROLE_NAME"
+	info "Role ARN: $ROLE_ARN"
+	info "Namesspace: $NAMESPACE"
+	info "Service Account: $SA_NAME"
+}
+
+function setup-service-account {
+	local sa_json="$(kubectl get sa -n $NAMESPACE -ojson $SA_NAME  2>&1 | (grep -v 'NotFound' || true))"
+	if [[ -z "$sa_json" ]]; then
+		warn "Service Account does not exist"
+		if [[ "$OPT_APPLY" -eq 1 ]]; then
+			cat <<-EOM | kubectl apply -f
+				apiVersion: v1
+				kind: ServiceAccount
+				metadata:
+	  			name: $SA_NAME
+	  			namespace: $NAMESPACE
+	  			annotations:
+	    			"eks.amazonaws.com/role-arn": $ROLE_ARN
+			EOM
+		fi
+	else
+		info "Service Account was found"
+		sa_role_arn="$(jq -erc '.metadata.annotations["eks.amazonaws.com/role-arn"]' <<< "$sa_json")"
+		if [[ "$ROLE_ARN" != "$sa_role_arn" ]]; then
+			if [[ "$OPT_APPLY" -eq 1 ]]; then
+				kubectl patch serviceaccount "$SA_NAME" -p "$(jq -ncer --arg arn "$ROLE_ARN" '.metadata.annotations["eks.amazonaws.com/role-arn"]=$arn')"
+			else
+				warn "eks.amazonaws.com/role-arn"
+				warn "  expected $ROLE_ARN" 
+				warn "  got      $sa_role_arn"
+			fi
+		fi
+	fi
+
+	
+	local rolebinding_json=$(kubectl get rolebinding -A -ojson | jq -erc --arg ns "$NAMESPACE" --arg sa "$SA_NAME" '[.items[]|select(.subjects[]|contains({namespace:$ns, name: $sa}))]')
+	if [[ "$rolebinding_json" != "[]" ]]; then
+		info "Found role-bindings:"
+		jq -cre '.[]|{namespace: .metadata.namespace, binding: .metadata.name, role: .roleRef.name}' <<< "$F"
+	elif [[ "$OPT_APPLY" -eq 1 ]]; then
+		: "create role (if not exists) and role bindings" 	
+	fi
+	
+
+}
+
+function setup-idp {
+	OIDC_PROVIDER_ARN="arn:aws:iam::$AWS_X_ACCOUNT_ID:oidc-provider/$JWKS_URI/id/$OIDC_ID"
+	title "Checking for AWS OIDC IdP Provider..."
+	OIDC_PROVIDER_JSON="$(aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$OIDC_PROVIDER_ARN" --region "$AWS_REGION" 2>&1 | (grep -v 'NoSuchEntity' || true))"
+	# .Url": "oidc.eks.us-east-1.amazonaws.com/id/06BA0F6E466FAF52F49EE0F636FB7442",
+	# .ClientIDList": [
+
+	# .ThumbprintList": [
+	if [[ -n "$OIDC_PROVIDER_JSON" ]]; then
+		info "found $OIDC_PROVIDER_ARN"
+	else
+		warn "expected $OIDC_PROVIDER_ARN but not found!"
+	fi
+
+	if [[ -z "$OIDC_PROVIDER_JSON" ]]; then
+		err -n "Creating AWS OIDC IdP Provider..."
+		aws iam	create-open-id-connect-provider \
+			--url	"$OIDC_PROVIDER" \
+			--client-id-list "$sts.amazonaws.com" \
+			--thumbprint-list "${THUMBPRINT,,}" \
+			--region "$AWS_REGION" | jq -er '.OpenIDConnectProviderArn' >/dev/null
+		err "done"
+		echo "- ARN: $OIDC_PROVIDER_ARN"
+	elif ! jq -er --arg tb "${THUMBPRINT,,}" '.ThumbprintList|map(ascii_downcase)|index($tb)>=0' 1>/dev/null 2>&1 <<< "$OIDC_PROVIDER_JSON"; then
+			err -n "Updating thumbprints..."
+			aws iam update-open-id-connect-provider-thumbprint \
+			--open-id-connect-provider-arn "$OIDC_PROVIDER_ARN" \
+			--thumbprint-list $(jq -rnc --arg tb "${THUMBPRINT,,}" '.ThumbprintList|.+[$tb]|join(" ")' <<< "$OIDC_PROVIDER_JSON") \
+			1>/dev/null
+			err -n "done."
+	fi
+}
+
+function create-role {
+
+  # aws iam get-role --role-name steampipe --output json | jq -erc '.Role.AssumeRolePolicyDocument.Statement[].Principal.Federated'
+  # $OIDC_PROVIDER_ARN
+
+	# aws iam get-role --role-name steampipe --output json | jq -erc '.Role.AssumeRolePolicyDocument.Statement[].Condition.StringEquals'
+	# {"oidc.eks.us-east-1.amazonaws.com/id/06BA0F6E466FAF52F49EE0F636FB7442:sub":"system:serviceaccount:steampipe:steampipe-service","oidc.eks.us-east-1.amazonaws.com/id/06BA0F6E466FAF52F49EE0F636FB7442:aud":"sts.amazonaws.com"}
+
+	# MaxSessionDuration 3600
+	# aws iam get-role --role-name steampipe --output json                     ✓ ns-xl8aws 13:58
+	# aws iam get-role --role-name steampipe --output json > role.json 
+
+	
+	#aws iam update-role
+	#aws iam update-role  --role-name steampipe --assume-role-policy-document file://role.json
+	# aws iam update-role  --role-name steampipe --max-session-duration 7200
+  #aws iam update-role-description  --role-name steampipe  --description "xss" 
+  #aws iam update-role-description  --role-name steampipe  --description "EKS-IRSA-ServiceAccount-Role"
+  #aws iam get-role --role-name steampipe --output json --query 'Role.AssumeRolePolicyDocument' > role.json
+  #aws iam update-assume-role-policy --role-name steampipe --policy-document file://role.json
+	# aws iam get-role --role-name steampipe --assume-role-policy-document file:///tmp/trust-policy.json 
+
+	$ cat <<-EOF > /tmp/trust-policy.json 
+	{
+		"Version": "2012-10-17",
+		 "Statement": [
+					{
+						"Action": [
+							"sts:AssumeRoleWithWebIdentity"
+						],
+						"Condition": {
+							"StringEquals": {
+								"$OIDC_PROVIDER:aud": "sts.amazonaws.com",
+								"$OIDC_PROVIDER:sub": "system:serviceaccount:steampipe:steampipe-service"
+							}
+						},
+						"Effect": "Allow",
+						"Principal": {
+							"Federated": "$OIDC_PROVIDER_ARN"
+						}
+					}
+			]
+	}
+	EOF
+
+	$ aws iam create-role --role-name steampipe --assume-role-policy-document file:///tmp/trust-policy.json 
+	$ cat <<-EOF > /tmp/policy.json 
+	{
+			"Version": "2012-10-17",
+			"Statement": [
+					{
+							"Sid": "DenySecretAccess",
+							"Effect": "Deny",
+							"Action": [
+									"kms:Decrypt*",
+									"ssm:GetParameters*",
+									"secretsmanager:GetSecret*",
+									"lambda:GetFunction*"
+							],
+							"Resource": "*"
+					}
+			]
+	}
+	EOF
+	$ aws iam put-role-policy --role-name steampipe --policy-name steampipe-deny --policy-document file:///tmp/policy.json 
+	$ aws iam attach-role-policy --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess --role-name steampipe
+}
+
+
+function foo {
+	cat <<-EOM
+		You can simply reference a ServiceAccount from another namespace in the RoleBinding:
+
+		apiVersion: rbac.authorization.k8s.io/v1beta1
+		kind: Role
+		metadata:
+			name: pod-reader
+			namespace: ns2
+		rules:
+		- apiGroups: [""]
+			resources: ["pods"]
+			verbs: ["get", "list", "watch"]
+		---
+		apiVersion: rbac.authorization.k8s.io/v1
+		kind: RoleBinding
+		metadata:
+			name: pod-reader-from-ns1
+			namespace: ns2
+		roleRef:
+			apiGroup: rbac.authorization.k8s.io
+			kind: Role
+			name: pod-reader
+		subjects:
+		- kind: ServiceAccount
+			name: ns1-service-account
+			namespace: ns1
+	EOM
+} 
+
+function get-all-thumbprints {
+
+	REGIONS="us-east-2
+	    us-east-1 
+	    us-west-1
+	    us-west-2
+	    ap-east-1
+	    ap-northeast-2
+	    ap-southeast-1
+	    ap-southeast-2
+	    ap-northeast-1
+	    eu-central-1
+	    eu-west-1
+	    eu-west-2
+	    eu-west-3
+	    eu-north-1
+	    me-south-1
+	    sa-east-1"
+
+	for REGION in $REGIONS ; do
+	    JWKS_URI="oidc.eks.${REGION}.amazonaws.com"
+
+	    # Extract all certificates in separate files
+	    # https://unix.stackexchange.com/questions/368123/how-to-extract-the-root-ca-and-subordinate-ca-from-a-certificate-chain-in-linux
+	    TEMP=$(mktemp -d -t oidc-eks-XXXX)
+	    openssl s_client -servername $JWKS_URI -showcerts -connect $JWKS_URI:443 < /dev/null 2>/dev/null | awk -v dir="$TEMP" '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/{ if(/BEGIN/){a++}; out=dir"/cert00"a".crt"; print >out }'
+
+	    # Assume last found certificate in chain is the ROOT_CA
+	    ROOT_CA=$(ls -1 $TEMP/* | tail -1)
+
+	    # Extract fingerprint in desired format (no header, no colons)
+	    THUMBPRINT=$(openssl x509 -fingerprint -noout -in $ROOT_CA | sed 's/^.*=//' | sed 's/://g')
+	    printf '{"%s": "%s"}\n' $REGION $THUMBPRINT
+	    rm -rf $TEMP
+	done
+}
+
+
+function test-sa {
+	NAMESPACE="steampipe"
+	local tmp="$(mktemp -d)"
+	pod="testing-$(openssl rand -hex 8)"
+	kubectl run -q  -n "$NAMESPACE" --wait=true --image=amazon/aws-cli:latest --pod-running-timeout=60m \
+		--overrides="$(jq -rnc --arg sa "steampipe-service" '.apiVersion="v1"|.metadata.labels.app="debug"|.spec.serviceAccount=$sa')" \
+	 "$pod" --command -- aws sts get-caller-identity 2>"$tmp/err" 1>"$tmp/err"
+	# kubectl wait --for=condition=complete --timeout=30s pod/$pod -n $NAMESPACE 
+ 	kubectl logs "$pod" 
+  # arn:aws:sts::141903343889:assumed-role/steampipe/botocore-session-1688418713
+ 	kubectl get pod "$pod" -n "$NAMESPACE" -ojson | jq -er '.spec.containers[].env|from_entries'
+ 	# if pod was launched correctly it should have AWS_ROLE_ARN from serviceaccount
+ 	#json.items[82].spec.containers[0].env[0].name = "AWS_DEFAULT_REGION";
+	#json.items[82].spec.containers[0].env[0].value = "us-east-1";
+	#json.items[82].spec.containers[0].env[1] = {};
+	#json.items[82].spec.containers[0].env[1].name = "AWS_REGION";
+	#json.items[82].spec.containers[0].env[1].value = "us-east-1";
+	#json.items[82].spec.containers[0].env[2] = {};
+	#json.items[82].spec.containers[0].env[2].name = "AWS_ROLE_ARN";
+	#json.items[82].spec.containers[0].env[2].value = "arn:aws:iam::141903343889:role/steampipe";
+	#json.items[82].spec.containers[0].env[3] = {};
+	#json.items[82].spec.containers[0].env[3].name = "AWS_WEB_IDENTITY_TOKEN_FILE";
+	#json.items[82].spec.containers[0].env[3].value = "/var/run/secrets/eks.amazonaws.com/serviceaccount/token";
+
+}
+
+function sa-shell {
+	NAMESPACE="steampipe"
+	local tmp="$(mktemp -d)"
+	pod="testing-$(openssl rand -hex 8)"
+	kubectl run -it --rm  -n "$NAMESPACE" --wait=true --image=alpine:latest --pod-running-timeout=60m \
+		--overrides="$(jq -rnc --arg sa "steampipe-service" '.apiVersion="v1"|.metadata.labels.app="debug"|.spec.serviceAccount=$sa')" \
+	 "$pod" --command -- aws sts get-caller-identity 2>"$tmp/err" 1>"$tmp/err"
+	# kubectl wait --for=condition=complete --timeout=30s pod/$pod -n $NAMESPACE 
+ 	kubectl logs "$pod" 
+}
+
+function cleanup-debug-pod {
+	kubectl get pods -A -ojson | jq -er '.items[]|select(.metadata.labels.app?=="debug")|[.metadata.namespace, .metadata.name]|@tsv' \
+		|  xargs -L1 sh -c 'kubectl -n $0 delete pod $1'
+}
+# get-all-thumbprints 
+
+init "$@"
+setup-idp
+#setup-service-account
+test-sa
+
+
+### https://oblcc.com/blog/configure-openid-connect-for-gitlab-and-aws/
+
+function xx {
+	cat <<-EOM 
+	{
+		"Version": "2012-10-17",
+		"Statement": [       
+			{
+				"Sid": "GitLabPolicy",
+				"Effect": "Allow",
+    	 	"Action": "sts:GetCallerIdentity",
+  	   	"Resource": "*"
+			}
+		]
+	}
+	EOM
+}

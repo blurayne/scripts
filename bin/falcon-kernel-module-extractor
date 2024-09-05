@@ -17,7 +17,7 @@ from elftools.elf.elffile import ELFFile
 from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import StringTableSection
 
-
+import traceback
 
 LZMA_SIG = b'\xfd7zXZ\x00'
 ELF_SIG  = b'\x7fELF'
@@ -52,8 +52,14 @@ class App:
         parser.add_argument('-d', '--distro',  dest="distro", nargs=1, help='distro')
         parser.add_argument('-r', '--regex', dest="filter", nargs=1, help='regex filter for filename')
         parser.add_argument('-f', '--modulearchive', dest="modulearchive", help='kernel module archive',default="/opt/CrowdStrike/KernelModuleArchive")
-        # parser.print_help()
+        parser.add_argument('-x', '--xtract', '--extract', dest="extract", action='store_true', help="Extract modules")
+        parser.add_argument('-l', '--list', dest="list", action='store_true', help="Only list modules (JSONL)")
+
         self.args = parser.parse_args()
+        if not self.args.extract and not self.args.list:
+            parser.print_help()
+            sys.exit(1)
+
 
         if not os.access(self.args.modulearchive, os.R_OK):
             # If the file cannot be read by the current user, elevate user permissions by exec
@@ -108,11 +114,8 @@ class App:
                 module_file = BytesIO(module_data)
                 elf = ELFFile(module_file) 
                 
-
-                # sys.stdout.write(f"size {module_size}\n")
                 modinfo = elf.get_section_by_name('.modinfo')
                 modinfo_lines = [i.decode('ASCII').strip() for i in modinfo.data().split(b'\x00') if len(i)>0]
-
 
                 modinfo_vars = {}                
                 for item in modinfo_lines:
@@ -139,25 +142,20 @@ class App:
                         sys.stderr.write(f"Unknown module type: {desc}\n")
                         sys.exit(1)
 
-                # filename = f"{modinfo_vars['distro']}/lib/modules/{version}/{name}.ko"
-
-                filename = f"{modinfo_vars['distro']}/{version}/{name}.ko"                
-
-                # filename = f"{name}-{modinfo_vars['distro']}-{version}.ko"
-
-                # sys.stdout.write(f"{filename}\n")
-
-                #with open(filename, "wb") as module_file:
-                #    module_file.write(module_data)
-                # CrowdStrike KAL Module
+                if self.args.extract:
+                    sys.stdout.write(f"{filename}\n")
+                    filename = f"{modinfo_vars['distro']}/{version}/{name}.ko"
+                    # filename = f"{modinfo_vars['distro']}/lib/modules/{version}/{name}.ko"
+                    # filename = f"{name}-{modinfo_vars['distro']}-{version}.ko"
+                    with open(filename, "wb") as module_file:
+                        module_file.write(module_data)
                 
+                start_offset = current_offset + module_size
+                # sys.stdout.write(f'found offset:{current_offset} size:{end_offset-current_offset}\n')
+
             except Exception as e:
-                pprint(e, out=sys.stderr)
-                pass
-
-            start_offset = current_offset + module_size
-
-            # sys.stdout.write(f'found offset:{current_offset} size:{end_offset-current_offset}\n')
+                traceback.print_exc(file=sys.stderr)
+                pass        
 
 
 if __name__ == '__main__':
