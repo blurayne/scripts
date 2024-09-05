@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 
-## ### https://oblcc.com/blog/configure-openid-connect-for-gitlab-and-aws/
+# https://oblcc.com/blog/configure-openid-connect-for-gitlab-and-aws/
+# https://docs.aws.amazon.com/eks/latest/userguide/enable-iam-roles-for-service-accounts.html
 
 set -eEuo pipefail
 
 SELF="${0}"
 BASENAME="${SELF##*/}"
 
-# https://docs.aws.amazon.com/eks/latest/userguide/enable-iam-roles-for-service-accounts.html
+
 
 AWS_PROFILE="${AWS_PROFILE}"
 AWS_REGION=""
@@ -27,11 +28,6 @@ SA_NAME=""
 K8S_ROLE_NAME=""
 ROLE_NAME=""
 ROLE_ARN=""
-
-# kubectl get sa  -n $NAMESPACE -ojson
-
-# arn:aws:iam::$AWS_X_ACCOUNT:ID:role/$AWS_IAM_ROLE_NAME
-
 
 function err() {
 	printf "\e[1m\e[31m\e[38;2;255;0;0m%s\x1b[0m\n" "${1?message}" >&2
@@ -138,7 +134,7 @@ function parse-args {
 				OPT_APPLY=0
 				;;
 
-			-K|--apply) 
+			-K|--apply|--fix) 
 				OPT_APPLY=1
 				;;
 
@@ -244,7 +240,7 @@ function setup-env {
 	fi
 	ROLE_ARN="arn:aws:iam::$AWS_X_ACCOUNT_ID:role/$ROLE_NAME"
 	info "Role ARN: $ROLE_ARN"
-	info "Namesspace: $NAMESPACE"
+	info "Namespace: $NAMESPACE"
 	info "Service Account: $SA_NAME"
 }
 
@@ -277,7 +273,6 @@ function setup-service-account {
 		fi
 	fi
 
-	
 	local rolebinding_json=$(kubectl get rolebinding -A -ojson | jq -erc --arg ns "$NAMESPACE" --arg sa "$SA_NAME" '[.items[]|select(.subjects[]|contains({namespace:$ns, name: $sa}))]')
 	if [[ "$rolebinding_json" != "[]" ]]; then
 		info "Found role-bindings:"
@@ -285,17 +280,13 @@ function setup-service-account {
 	elif [[ "$OPT_APPLY" -eq 1 ]]; then
 		: "create role (if not exists) and role bindings" 	
 	fi
-	
-
 }
 
-function setup-idp {
+function check-idp {
 	OIDC_PROVIDER_ARN="arn:aws:iam::$AWS_X_ACCOUNT_ID:oidc-provider/$JWKS_URI/id/$OIDC_ID"
 	title "Checking for AWS OIDC IdP Provider..."
 	OIDC_PROVIDER_JSON="$(aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$OIDC_PROVIDER_ARN" --region "$AWS_REGION" 2>&1 | (grep -v 'NoSuchEntity' || true))"
-	# .Url": "oidc.eks.us-east-1.amazonaws.com/id/06BA0F6E466FAF52F49EE0F636FB7442",
 	# .ClientIDList": [
-
 	# .ThumbprintList": [
 	if [[ -n "$OIDC_PROVIDER_JSON" ]]; then
 		info "found $OIDC_PROVIDER_ARN"
@@ -303,6 +294,12 @@ function setup-idp {
 		warn "expected $OIDC_PROVIDER_ARN but not found!"
 	fi
 
+	if [[ "$OPT_APPLY" -eq 1 ]]; then
+  	setup-idp
+  fi
+}
+
+function setup-idp {
 	if [[ -z "$OIDC_PROVIDER_JSON" ]]; then
 		err -n "Creating AWS OIDC IdP Provider..."
 		aws iam	create-open-id-connect-provider \
@@ -328,17 +325,13 @@ function create-role {
   # $OIDC_PROVIDER_ARN
 
 	# aws iam get-role --role-name steampipe --output json | jq -erc '.Role.AssumeRolePolicyDocument.Statement[].Condition.StringEquals'
-	# {"oidc.eks.us-east-1.amazonaws.com/id/06BA0F6E466FAF52F49EE0F636FB7442:sub":"system:serviceaccount:steampipe:steampipe-service","oidc.eks.us-east-1.amazonaws.com/id/06BA0F6E466FAF52F49EE0F636FB7442:aud":"sts.amazonaws.com"}
 
 	# MaxSessionDuration 3600
-	# aws iam get-role --role-name steampipe --output json                     ✓ ns-xl8aws 13:58
+	# aws iam get-role --role-name steampipe --output json
 	# aws iam get-role --role-name steampipe --output json > role.json 
 
-	
-	#aws iam update-role
 	#aws iam update-role  --role-name steampipe --assume-role-policy-document file://role.json
 	# aws iam update-role  --role-name steampipe --max-session-duration 7200
-  #aws iam update-role-description  --role-name steampipe  --description "xss" 
   #aws iam update-role-description  --role-name steampipe  --description "EKS-IRSA-ServiceAccount-Role"
   #aws iam get-role --role-name steampipe --output json --query 'Role.AssumeRolePolicyDocument' > role.json
   #aws iam update-assume-role-policy --role-name steampipe --policy-document file://role.json
@@ -460,14 +453,16 @@ function get-all-thumbprints {
 
 
 function test-sa {
-	NAMESPACE="steampipe"
+	set -x
 	local tmp="$(mktemp -d)"
 	pod="testing-$(openssl rand -hex 8)"
-	kubectl run -q  -n "$NAMESPACE" --wait=true --image=amazon/aws-cli:latest --pod-running-timeout=60m \
-		--overrides="$(jq -rnc --arg sa "steampipe-service" '.apiVersion="v1"|.metadata.labels.app="debug"|.spec.serviceAccount=$sa')" \
-	 "$pod" --command -- aws sts get-caller-identity 2>"$tmp/err" 1>"$tmp/err"
-	# kubectl wait --for=condition=complete --timeout=30s pod/$pod -n $NAMESPACE 
- 	kubectl logs "$pod" 
+	kubectl run -n "$NAMESPACE" --wait=true --image=amazon/aws-cli:latest --pod-running-timeout=60m \
+		--overrides="$(jq -rnc --arg sa "$SA_NAME" '.apiVersion="v1"|.metadata.labels.app="debug"|.spec.serviceAccount=$sa')" \
+	 "$pod" --command -- sleep infinity
+   # kubectl wait --for=condition=complete --timeout=30s pod/$pod -n $NAMESPACE 
+  kubectl exec -it -n "$NAMESPACE" "$pod" -- aws sts get-caller-identity | tee "$tmp/auth.json"
+	
+ 	kubectl logs -n "$NAMESPACE"  "$pod" 
   # arn:aws:sts::141903343889:assumed-role/steampipe/botocore-session-1688418713
  	kubectl get pod "$pod" -n "$NAMESPACE" -ojson | jq -er '.spec.containers[].env|from_entries'
  	# if pod was launched correctly it should have AWS_ROLE_ARN from serviceaccount
@@ -486,11 +481,10 @@ function test-sa {
 }
 
 function sa-shell {
-	NAMESPACE="steampipe"
 	local tmp="$(mktemp -d)"
 	pod="testing-$(openssl rand -hex 8)"
 	kubectl run -it --rm  -n "$NAMESPACE" --wait=true --image=alpine:latest --pod-running-timeout=60m \
-		--overrides="$(jq -rnc --arg sa "steampipe-service" '.apiVersion="v1"|.metadata.labels.app="debug"|.spec.serviceAccount=$sa')" \
+		--overrides="$(jq -rnc --arg sa "$SA_NAME" '.apiVersion="v1"|.metadata.labels.app="debug"|.spec.serviceAccount=$sa')" \
 	 "$pod" --command -- aws sts get-caller-identity 2>"$tmp/err" 1>"$tmp/err"
 	# kubectl wait --for=condition=complete --timeout=30s pod/$pod -n $NAMESPACE 
  	kubectl logs "$pod" 
@@ -500,10 +494,10 @@ function cleanup-debug-pod {
 	kubectl get pods -A -ojson | jq -er '.items[]|select(.metadata.labels.app?=="debug")|[.metadata.namespace, .metadata.name]|@tsv' \
 		|  xargs -L1 sh -c 'kubectl -n $0 delete pod $1'
 }
-# get-all-thumbprints 
+
 
 init "$@"
-setup-idp
+# check-idp
 #setup-service-account
 test-sa
 
