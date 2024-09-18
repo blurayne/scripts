@@ -1,0 +1,4 @@
+ #!/bin/sh
+
+exec aws-policies-get-json | jq -er '[.serviceMap[]|.StringPrefix as $pre|.Actions|map($pre+":"+.)[]]|sort[]'
+

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+export GUM_INPUT_WIDTH="$(tput cols)"
+
+gum style \
+        --foreground 212 --border-foreground 212 --border double \
+        --align center --width $(( $(tput cols) -4 )) --margin "1 1" --padding "1 1" "$(echo "OCR LOGIN" | figlet -f ~/.local/share/figlet/doom.flf)"
+
+function main() {
+	local registry="${1:-}"
+	local client="${2:-}"
+	local user="${3:-}"
+	local pass="${4:-}"
+	local cmd=()
+	if [[ -z "$registry" ]]; then
+		local type="$(gum choose "AWS ECR (\${account}.dkr.ecr.\${region}.dkr.ecr.us-east-1.amazonaws.com)" "Github Container Registry (ghcr.io)" "GitLab (registry.gitlab.com)" "Docker (registry-1.docker.io)" "Quay (quay.io)" "Other")"
+		case "${type,}" in
+			*ecr*)
+				local region="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region || printf "us-east-1")}}"
+				cmd=(aws ecr get-login-password --region "$region")
+				pass="$("${cmd[@]}")"
+				registry="$(aws sts get-caller-identity --query 'Account' --output text).dkr.ecr.$region.amazonaws.com"
+				registry="$(gum input --value "$registry" --prompt "Registry› ")"
+				user="AWS"
+				;;
+
+			*google*)
+				local region="$(gcloud config get-value compute/region || printf "us-east-1")"
+				registry="$(gum choose "${region%%-*}.gcr.io" "${region}.pkg.dev")"
+				registry="$(gum input --value "$registry" --prompt "Registry› ")"
+				user="$(gcloud config get-value account || true)"
+				user="$(gum input --value "$user" --prompt "Username› ")"
+				pass="$(echo "$registry" | docker-credential-gcr get || true)"
+				pass="$(gum input --value "$pass" --password --prompt "Password› ")"
+				;;
+
+			*gitlab*)
+				registry="registry.gitlab.com"
+				registry="$(gum input --value "$registry" --prompt "Registry› ")"
+				user="$(gum input --value "${GITLAB_USERNAME:-}" --placeholder "<your username>" --prompt "Username›" )"
+				pass="$(gum input --value "${GITLAB_TOKEN:-}" --placeholder "<your token>" --prompt "Password› ")"
+				;;
+			
+			*)
+				registry="$(gum input --placeholder "$registry" --prompt "Registry› ")"
+				user="$(gum input --placeholder "$registry" --prompt "Username› ")"
+				pass="$(gum input --placeholder "$registry" --password --prompt "Password› ")"
+				;;
+		esac
+	fi
+	
+	if [[ -z "$client" ]]; then
+		client="$(gum choose "docker" "podman" "skopeo" "crane" "other" --selected="docker")"
+		if [[ "$client" == "other" ]]; then
+			client="$(gum input --placeholder "" --prompt "Client› ")"
+		fi
+	fi
+	if [[ "${#cmd}" -gt 0 ]]; then
+		printf "%q " "${cmd[@]}"
+		printf " | "
+	else
+		printf "echo PASS | " 
+	fi
+	printf "%q " "$client" login --username "$user" --password-stdin "$registry"
+	printf "$pass" | "$client" login --username "$user" --password-stdin "$registry";
+}
+
+main "$@"

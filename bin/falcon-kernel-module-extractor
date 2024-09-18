@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
 
+##
+#
+# Dependencies:
+#   pip3 install pyelftools
+#
+# https://terenceli.github.io/%E6%8A%80%E6%9C%AF/2018/06/02/linux-loadable-module
+# cat <(grep -bUoaP "\x7fELF"  blob ) <(grep -bUoaP "~Module signature appended~" blob) | sort -n | less   
+# grep -bUoaP "depends=[\x20-\x7e]+"  blob   
+# grep -bUoaP "[a-z]{4,}=[\x20-\x7e]+"  blob 
+# objdump -s -j .modinfo falcon-sensor-amzn1-4.14.225-121.357.amzn1.x86_64.kal.ko
+# meld <(objdump -S falcon-sensor-ubuntu22-5.15.0-53-generic.kal.ko) <(objdump -S falcon-sensor-ubuntu22-5.15.0-50-generic.kal.ko) 
+# falcon-kernel-module-extractor -l | tee output.jsonl
+# cat output.jsonl | jq -sr 'sort_by(.distro?, .vermagic?, .description)|.[]|"\(.distro)\t\(.vermagic|gsub("^CSVERMAGIC";""))\t\(.name)\t\(.description)"'   
+# cat output.jsonl | jq -sr '[.[].distro]|unique[]'    
+# cat output.jsonl | jq -sr '[.[]|[.distro,(.vermagic|gsub("^CSVERMAGIC";""))]]|unique[]|join("-")' | sort -V      
+
+
+
+
 import struct
 import sys
 import re
@@ -22,14 +41,6 @@ import traceback
 LZMA_SIG = b'\xfd7zXZ\x00'
 ELF_SIG  = b'\x7fELF'
 END_SIG = b'~Module signature appended~'
-# https://terenceli.github.io/%E6%8A%80%E6%9C%AF/2018/06/02/linux-loadable-module
-
-#  cat <(grep -bUoaP "\x7fELF"  blob ) <(grep -bUoaP "~Module signature appended~" blob) | sort -n | less   
-# grep -bUoaP "depends=[\x20-\x7e]+"  blob   
-# grep -bUoaP "[a-z]{4,}=[\x20-\x7e]+"  blob 
-# objdump -s -j .modinfo falcon-sensor-amzn1-4.14.225-121.357.amzn1.x86_64.kal.ko
-# meld <(objdump -S falcon-sensor-ubuntu22-5.15.0-53-generic.kal.ko) <(objdump -S falcon-sensor-ubuntu22-5.15.0-50-generic.kal.ko) 
-
 
 class App:
 

@@ -1,0 +1,30 @@
+#!/bin/bash
+
+set -euo pipefail
+
+function main() {
+	local arg
+	local cmds=(docker podman skopeo)
+	local cmd
+	local aws_args=()
+	local token
+	while [[ $# -gt 0 ]]; do
+		arg="$1"
+		shift 1
+		case "$arg" in
+			docker|skopeo|podman)
+				cmds+=(cmd)
+				;;
+			*)
+				aws_args+=("$arg")
+				;;
+		esac
+	done
+	IFS=$'\t' && read -r token endpoint _ <<< "$(aws "${aws_args[@]})" ecr get-authorization-token --query "authorizationData[0] | [authorizationToken, proxyEndpoint] | join('"$'\t'"', @)" --output text)"
+	token=$(base64 -d <<< "${token}" | sed 's/^AWS://') 
+	for cmd in "${cmds[@]}"; do
+		printf '%s' $token | docker login --username AWS --password-stdin "${endpoint}"
+	done
+}
+
+main "$@""

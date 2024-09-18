@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+# USAGE 
+#
+#   skopeo-inspect-manifest alpine:latest
+#
+# OUTPUT
+#
+#   STDOUT  {"digest":"sha256:e5b3b02d8e82055f5ce7ff316164d07cfab210244fe1869385cc84378b42cbce","platform":{"architecture":"arm64","os":"linux","variant":"v8"}}
+#   STDOUT  {"digest":"sha256:9cee2b382fe2412cd77d5d437d15a93da8de373813621f2e4d406e3df0cf0e7c","platform":{"architecture":"amd64","os":"linux"}}
+#   STDERR  manifest is multi-arch
+
+set -eEuo pipefail
+
+manifest="${1?manifest}"
+if [[ "$manifest" != *://* ]]; then
+	manifest="docker://${manifest}"
+fi
+
+function inspect-multiarch {
+	skopeo inspect --raw "${manifest}" | jq -c '.manifests[]|{digest,platform}' 2>/dev/null && echo "manifest is multi-arch" >&2
+}
+
+function inspect-singlearch {
+	local digest
+	digest="$(skopeo inspect "${manifest}" | jq -r '.Digest')"
+	skopeo inspect --config "${manifest}" | jq -c --arg digest "$digest" -r '{digest: $digest, platform: ({architecture, os, variant}|with_entries(select(.value!=null))) }'
+	echo "manifest is single-arch" >&2
+}
+
+inspect-multiarch || inspect-singlearch || (echo "error: couldn't handle $manifest" >&2; exit 1)

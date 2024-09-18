@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+
+## skopeo-find-tags – find a OCI tags for an remote image tag
+#
+# USAGE
+#   use with like docker.io/jboss/jgroups-gossip@sha256:3f7253867b184b5a473cf660495457bb15c82d2780041e8b590debf9cb172727
+#
+# TODO 
+#    fails on superset since >45K tags!!!
+#      e.g. apachesuperset.docker.scarf.sh/apache/superset@sha256:84dea99221c585192762d16bee7364130fccddfeffbfb1ec33a13b04eff9e92b
+
+set -eEuo pipefail
+shopt -s inherit_errexit
+
+function main() {
+    local search="${1?image-path-prefix-with-docker-io}"
+    local repo="${search%%@*}"
+    local found=0
+    local shas=()
+    local tag
+    local tags
+    local total
+    local current=0
+    local digest
+    printf "Resolving digest..."  >&2
+    # supports v1 or multiarch manifest
+    shas=($(skopeo inspect --raw docker://${search} | jq -re 'if (.config) then .config.digest elif (.manifests) then .manifests[].digest else ("no sha found in: \(.|@json)"|stderr) end'))
+    printf "found:\n"
+    printf "%s\n" "${shas[@]}"
+    printf "Iterating through tags\n"  >&2
+    tags=($(skopeo list-tags docker://${repo} | jq -er '.Tags[]'))
+    total="${#tags[@]}"
+    for tag in "${tags[@]}"; do
+      let 'current += 1'
+      digest="$(skopeo inspect --raw docker://${repo}:${tag} | jq -re '.config.digest')"
+      printf "\33[2K\r[$current/$total] Checking $tag" >&2
+      for sha in ${shas[@]}; do
+        if [[ "$digest" == "$sha" ]]; then
+          printf "\33[2K\r" >&2
+          if [[ "$found" -eq 0 ]]; then
+            printf "Tag\tDigest\n"
+            found=1
+          fi
+          printf "${tag}\t${digest}\n"
+        fi
+      done
+    done  
+    if [[ "$found" -eq 0 ]]; then
+      printf "\33[2K\rNo tags found!\n"  >&2
+    fi
+}
+
+main "$@"
