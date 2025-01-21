@@ -30,7 +30,7 @@ DEBUG=0
 COLORIZE=-1
 PER_PAGE=100 # 100 is gilab's max page size
 VERSION="0.1"
-
+OPT_MARKDOWN=0
 
 ##
 # compare one version against another
@@ -342,6 +342,7 @@ function usage {
 		  --files                            Only output list of matched files 
 		  --projects                         Only output list of matched projects
 		  --matches                          Only output list of matched files and line numbers
+  		  --md                               Output for markdown
 		  --grep                             Grep Output (Default)
 		  --rg|--ack|--ag                    ack|ripgrep-like Output format
 		  --tar                              Output a tarball containing all the files and a results.jsonl
@@ -386,7 +387,7 @@ function usage {
 		
 		QUERY SYNTAX (Regular Gitlab Code Search)
 
-		  <QUERY>            Search in code             DOCKER_HOST
+		  <QUERY>            Search in code             Example
 
 		  filename:, fn:     Filename                   filename:*spec.rb
 		  path:              Repository location        path:spec/workers/
@@ -395,6 +396,8 @@ function usage {
 		  blob:              Git object ID              blob:998707*
 
                             'extension:' and 'blob:' do return exact matches only!
+
+          |                  Logical OR                 bug | (display +banner)
 
 		ADDITIONAL QUERY SYNTAX 
 
@@ -422,6 +425,11 @@ function usage {
 
 		  helper -extension:yml -extension:js
 		  Returns helper in all files except files with a .yml or .js extension.
+
+		  helper path:lib/git
+		  Returns helper in all files with a lib/git
+
+		  https://docs.gitlab.com/ee/user/search/advanced_search.html
 
 		USAGE EXAMPLES
 
@@ -544,6 +552,9 @@ function init-args {
 			-j)
 				OUTPUT_FORMAT='json'
 				;;
+			--md|--markdown)
+				OPT_MARKDOWN=1
+				;;
 
 			--grep|--list|--json|--jsonl|--hits|--grep|--rg|--ndjson|--full|--matches|--projects|--files|--tar|--ack|--ag|--dir=*)
 				OUTPUT_FORMAT="${arg#--}"
@@ -596,6 +607,7 @@ function init-args {
 		esac
 	done
 
+	OPT_MARKDOWN="${OPT_MARKDOWN:0}"
 	if [[ "$OUTPUT_FORMAT" == "dir="* ]]; then
 		opt="${OUTPUT_FORMAT#*=}"
 		set-output-dir "$opt"
@@ -723,7 +735,8 @@ function request {
 	# - .matches aggregates matched per project/file/ref
 	debug "Post-Process #3 on $TMP/results.jsonl"
 	jq --arg tmp "$TMP" --argjson linesbefore "$GLAB_LINES_BEFORE" --argjson linesafter "$GLAB_LINES_AFTER" -sc '
-		group_by(.project_id,.path,.ref)
+		[.[]|select(length>0)]
+		|group_by(.project_id,.path,.ref)
 		|sort_by(.[0].full_path,.[0].path,.[0].ref)
 		|.[] as $g
 		|$g[0]
@@ -732,8 +745,10 @@ function request {
 		# if linecount is smaller then 5 then matching line is probably the starting lines
 		# gitlab doesnt explicitly outline the matching line, it sucks so we "try" to make it less bad
 		|([.data // ""|scan("\n";"g")]|length) as $linecnt
+
 		|.matches=[
 			$g[]
+			|if (.startline=null) then (.startline=1|.onlyfilematch=true) end
 			|(if (($linesbefore+$linesafter+1) < $linecnt) then (.startline+$linesbefore) else (.startline-1) end) as $matchline
 			|{startline,matchline:$matchline,data}
 		]
@@ -949,20 +964,31 @@ function output_format_filter {
 			;;
 
 		files)
-			jq -r --argjson is_color "$(json_bool "$COLORIZE")" '
-				def ansi_href($title;$url):
-					"\u001b\u005d\u0038\u003b\u003b\($url)\u0007\($title)\u001b\u005d\u0038\u003b\u003b\u0007";
-
-				"[\(input_line_number)] \(.project_path)/-/\(.path)" as $title
-				|if ($is_color) then
+			if [[ "$OPT_MARKDOWN" -eq 1 ]]; then
+				jq -r '
+					"\(.project_path)/-/\(.path)" as $title
 					# "https://gitlab.com/api/v4/projects/\(.project_id)/repository/files/\(.path|@uri)/raw?ref=\(.ref|@uri)" as $api_url
 					# "https://gitlab.com/\(.project_path)/-/raw/\(.ref|@uri)/\(.path)" as $raw_url
-					"https://gitlab.com/\(.project_path)/-/blob/\(.ref|@uri)/\(.path)" as $web_url
-					|ansi_href($title;$web_url)
-				else
-					$title
-				end
-			'
+					|"https://gitlab.com/\(.project_path)/-/blob/\(.ref|@uri)/\(.path)" as $web_url
+					|"- [ ] [\($title)](\($web_url))"
+				'
+			else
+				jq -r --argjson is_color "$(json_bool "$COLORIZE")" '
+					def ansi_href($title;$url):
+						"\u001b\u005d\u0038\u003b\u003b\($url)\u0007\($title)\u001b\u005d\u0038\u003b\u003b\u0007";
+
+					"[\(input_line_number)] \(.project_path)/-/\(.path)" as $title
+					|if ($is_color) then
+						# "https://gitlab.com/api/v4/projects/\(.project_id)/repository/files/\(.path|@uri)/raw?ref=\(.ref|@uri)" as $api_url
+						# "https://gitlab.com/\(.project_path)/-/raw/\(.ref|@uri)/\(.path)" as $raw_url
+						"https://gitlab.com/\(.project_path)/-/blob/\(.ref|@uri)/\(.path)" as $web_url
+						|ansi_href($title;$web_url)
+					else
+						$title
+					end
+				'
+			fi
+			
 			;;
 		projects)
 			jq -rs '[.[].project_path]|unique[]'
@@ -1130,7 +1156,7 @@ function main() {
 	
 	check-required-commands
 
-	trap  shutdown INT EXIT QUIT
+	trap shutdown INT EXIT QUIT
 
 	TMP="$(mktemp -d)"
 	debug "Temp directory is $TMP. Not cleaning up!" 
