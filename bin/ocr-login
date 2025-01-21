@@ -57,7 +57,7 @@ function main() {
 			client="$(gum input --placeholder "" --prompt "Client› ")"
 		fi
 	fi
-	if [[ "${#cmd}" -gt 0 ]]; then
+	if [[ "${#cmd[@]}" -gt 0 ]]; then
 		printf "%q " "${cmd[@]}"
 		printf " | "
 	else

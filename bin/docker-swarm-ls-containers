@@ -2,5 +2,24 @@
 
 set -eEuo pipefail
 
-docker node ps $(docker node ls -q) "$@"
+# nodes="$(docker node ls --format json)"
+
+# docker service ls --format json         
+# echo "$nodes" | jq -r '.ID' | rp -s -- docker node ps --filter "desired-state=running" --format json | jq -sr 'tabelize|tsv' | column -ts $'\t'
+#docker node ls -q  | jq 'docker -H \(INPUT) ps '
+
+docker node ls --format json | jq -r '[
+	"docker -H \(.Hostname) ps --format json",
+	"|",
+	"jq -c --arg h \(.Hostname|@sh) \"{Hostname: \\$h, ID, Image, Names, Ports, RunningFor, Command}\""
+]|join(" ")' \
+| parallel \
+| jq -Rr 'fromjson|[.Hostname, .ID, .Image, .Names, .Ports, .RunningFor, .Command]|join("\t")' \
+| sed '1 i\HOST\tID\tIMAGE\tNAME\tPORTS\tRUNNING FOR\tCOMMAND' \
+| column -ts $'\t'
+
+
+
+# docker service ls -q | rp -s -- docker service ps  --filter "desired-state=running" --format json   
+
 

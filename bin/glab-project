@@ -2,19 +2,64 @@
 
 set -eEuo pipefail
 
-git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [[ -e "$git_root/.git/config" ]]; then
-	while read -r project _; do
-		if [[ -n "$project" ]]; then
-			(
-				set -x;
-				curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$(jq -Rr @uri <<< "$project")/" \
-					| jq --arg ns "$project"  '{project_id: .id, name, path: .path_with_namespace, description, web_url, ssh_url_to_repo, http_url_to_repo}' \
-					| dasel -r json -w yaml | bat -l yaml  --decorations never 
-				exit 0
-			) 2>/dev/null 
-		fi
-	done < <(cat "$git_root/.git/config" | jq -Rr 'capture("git@(?=.*gitlab)([^:]+):(?<project>(([^/]+/))+[^\\.]+)(\\.git)?")|.project' | sort -u)
-fi
+function get() {
+	local namespace="${1?namespace}"
+	namespace="${namespace#/*}"
+	namespace="${namespace%*/}"
+	curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$(jq -Rr @uri <<< "$namespace")/" 2>/dev/null  \
+		|| curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/groups/$(jq -Rr @uri <<< "$namespace")" 2>/dev/null \
+		|| return 1
+}
 
-exit 1
+function output-filter() {
+	# if stdout is a terminal
+	if [[ -t 1 ]]; then
+		jq '
+			if (.project_id?!=0) then
+				{project_id: .id, name, path: .path_with_namespace, description, web_url, ssh_url_to_repo, http_url_to_repo}
+			elif (.project_id?!=0) then
+				{group_id: .id, name, path: .full_path, description, web_url}
+			else
+				{}
+			end
+		' \
+			| dasel -r json -w yaml | bat -l yaml  --decorations never
+		return
+	fi
+
+}
+
+function main() {
+	local url="${1:-}"
+	local namespace=""
+
+	# first call is to check if token is valid
+	curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/user" 1>/dev/null \
+
+	if [[ -n "$url" ]]; then
+		url="${url%.git}"
+		
+		url="${url//groups/}"
+		url="${url%%/-/*}"
+		url="${url%%\?*}"
+		url="${url%/}"
+		if [[ "$url" =~ https://gitlab.com/(.+) ]]; then
+			namespace="${BASH_REMATCH[1]}"
+		fi
+	fi
+	if [[ -n "$namespace" ]]; then
+		get "$namespace" | output-filter
+		return 0
+	fi
+
+	git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+	if [[ -e "$git_root/.git/config" ]]; then
+		while read -r namespace _; do
+			if [[ -n "$namespace" ]]; then
+				get "$namespace" | output-filter || true
+			fi
+		done < <(cat "$git_root/.git/config" | jq -Rr 'capture("git@(?=.*gitlab)([^:]+):(?<project>(([^/]+/))+[^\\.]+)(\\.git)?")|.project' | sort -u)
+	fi
+}
+
+main "$@"
