@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+ kubectl get nodes -ojson \
+ 	| jq -r '.items[]|[
+ 				.metadata.name,
+ 				(.spec.providerID|scan("i-.+")),
+ 				.metadata.labels.["topology.kubernetes.io/region"],
+ 				.metadata.labels.["node.kubernetes.io/instance-type"],
+ 				.status.nodeInfo.architecture,
+ 				.status.nodeInfo.kubeletVersion,
+ 				.status.nodeInfo.kubeProxyVersion,
+ 				.status.conditions[-1].reason
+ 	]|join("\t")' \
+ 	| sed '1iNAME\tPROVIDER ID\tTYPE\tREGION\tARCH\tKUBELET\tKUBEPROXY\tSTATUS' \
+ 	| column -ts $'\t'
+
+
+
+

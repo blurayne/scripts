@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+# Annotate k8s resource in order to allow helm to overwrite (make backup first!)
+#
+# USAGE
+#   helm-import-resource -n kube-system --release-name aws-vpc-cni --release-namespace kube-system kube-system DaemonSet aws-node 
+#   helm-import-resource -n kube-system --release-name aws-vpc-cni --release-namespace kube-system ClusterRoleBinding aws-node 
+#   helm-import-resource -n kube-system --release-name aws-vpc-cni --release-namespace kube-system clusterrole aws-node 
+#   helm-import-resource -n kube-system --release-name aws-vpc-cni --release-namespace kube-system serviceaccount aws-node 
+#
+# --release-namespace: the namespace as specified by helm -n <namespace>
+# --release-name: the namespace as specified by helm <relase-name>
+# -n|--namespace the namespace of the actual resource
+
+function main() {
+	local resource=""
+	local name=""
+	local release
+	local args=()
+	local namespace
+	local release_namespace
+	local backup_fn
+	while [[ "$#" -gt 0 ]]; do
+		arg="$1"
+		shift 1
+		case "$arg" in
+			-n|--namespace)
+				if [[ -z "$release_namespace" ]]; then
+					release_namespace="${1?namespace}"
+				fi
+				shift 1
+				args+=(-n "$namespace")
+				;;
+			--release-namespace)
+				release_namespace="${1?namespace}"
+				shift 1
+				;;
+			--release-name)
+				namespace="${1?namespace}"
+				shift 1
+				args+=(-n "$namespace")
+				;;
+			*)
+				if [[ -z "$resource" ]]; then
+					resource="${arg}"
+				elif [[ -z "$name" ]]; then
+					name="${1?name}"
+				else
+					printf "unexpected arg: $arg"
+					exit 1
+				fi
+				;;
+		esac
+	done
+	if [[ -z "$namespace" ]]; then
+		namespace="$(kubectl "${args[@]}" config view --minify -ojson| jq -r '.contexts[].context.namespace // "default"')"
+		args+=(-n "$namespace")
+		if [[ -z "$release_namespace" ]]; then
+			release_namespace="${namespace}"
+		fi
+	fi
+	backup_fn="backup.${namespace}.${resource,,}.${name,,}.$(date -Iseconds).yaml"
+	printf "Writing backup %s" "$backup_fn"
+	(set -x; kubectl get "${args[@]}" $resource $name -oyaml) > "backup.${namespace}.${resource,,}.${name,,}.$(date -Iseconds).yaml"
+	(set -x; kubectl annotate "${args[@]}" --overwrite $resource $name meta.helm.sh/release-name=$release)
+ 	(set -x; kubectl annotate "${args[@]}" --overwrite $resource $name meta.helm.sh/release-namespace=$release_namespace)
+ 	(set -x; kubectl label "${args[@]}" --overwrite $resource $name app.kubernetes.io/managed-by=Helm)
+}
+
+main "$@"
