@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+
+
+SCRIPT_NAME="${0##*/}"
+
+# Resource Type Reference https://docs.aws.amazon.com/serverlessrepo/latest/devguide/list-supported-resources.html
+
+function map() {
+	jq -Rr '
+		({
+		  "^arn:aws:ec2:(?<region>[^:]*):(?<account>[^:]*):vpc/(?<id>[^/]*)": "AWS::EC2::VPC",
+		  "^arn:aws:ec2:(?<region>[^:]*):(?<account>[^:]*):subnet/(?<id>[^/]*)": "AWS::EC2::Subnet",
+		  "^arn:aws:ec2:(?<region>[^:]*):(?<account>[^:]*):security-group/(?<id>[^/]*)": "AWS::EC2::SecurityGroup",
+		  "^arn:aws:ec2:(?<region>[^:]*):(?<account>[^:]*):network-interface/(?<id>[^/]*)": "AWS::EC2::NetworkInterface",
+		  "^arn:aws:ec2:(?<region>[^:]*):(?<account>[^:]*):instance/(?<id>[^/]*)": "AWS::EC2::Instance",
+		  "^arn:aws:ec2:(?<region>[^:]*):(?<account>[^:]*):volume/(?<id>[^/]*)": "AWS::EC2::Volume",
+		  "^arn:aws:ec2:(?<region>[^:]*):(?<account>[^:]*):key-pair/(?<id>[^/]*)": "AWS::EC2::KeyPair",
+		  "^arn:aws:s3:(?<region>[^:]*):(?<account>[^:]*):(?<id>[^/]*)": "AWS::S3::Bucket",
+		  "^arn:aws:rds:(?<region>[^:]*):(?<account>[^:]*):db/(?<id>[^/]*)": "AWS::RDS::DBInstance",
+		  "^arn:aws:rds:(?<region>[^:]*):(?<account>[^:]*):cluster/(?<id>[^/]*)": "AWS::RDS::DBCluster",
+		  "^arn:aws:rds:(?<region>[^:]*):(?<account>[^:]*):subgrp/(?<id>[^/]*)": "AWS::RDS::DBSubnetGroup",
+		  "^arn:aws:rds:(?<region>[^:]*):(?<account>[^:]*):pg/(?<id>[^/]*)": "AWS::RDS::DBParameterGroup",
+		  "^arn:aws:lambda:(?<region>[^:]*):(?<account>[^:]*):function/(?<id>[^/]*)": "AWS::Lambda::Function",
+		  "^arn:aws:dynamodb:(?<region>[^:]*):(?<account>[^:]*):table//(?<id>[^/]*)": "AWS::DynamoDB::Table",
+		  "^arn:aws:sqs:(?<region>[^:]*):(?<account>[^:]*):(?<id>[^/]*)": "AWS::SQS::Queue",
+		  "^arn:aws:sns:(?<region>[^:]*):(?<account>[^:]*):(?<id>[^/]*)": "AWS::SNS::Topic",
+		  "^arn:aws:sns:(?<region>[^:]*):(?<account>[^:]*):/(?<id>[^/]*):subscription/(?<id>[^/]*)": "AWS::SNS::Subscription",
+		  "^arn:aws:elasticloadbalancing:(?<region>[^:]*):(?<account>[^:]*):loadbalancer/(?<id>[^/]*)": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+		  "^arn:aws:elasticloadbalancing:(?<region>[^:]*):(?<account>[^:]*):targetgroup/(?<id>[^/]*)": "AWS::ElasticLoadBalancingV2::TargetGroup",
+		  "^arn:aws:elasticloadbalancing:(?<region>[^:]*):(?<account>[^:]*):listener/(?<id>[^/]*)": "AWS::ElasticLoadBalancingV2::Listener",
+		  "^arn:aws:autoscaling:(?<region>[^:]*):(?<account>[^:]*):autoScalingGroup:.*:autoScalingGroupName/(?<id>[^/]*)": "AWS::AutoScaling::AutoScalingGroup",
+		  "^arn:aws:autoscaling:(?<region>[^:]*):(?<account>[^:]*):launchConfiguration:.*:launchConfigurationName/(?<id>[^/]*)": "AWS::AutoScaling::LaunchConfiguration",
+		  "^arn:aws:iam:(?<region>[^:]*):(?<account>[^:]*):role/(?<id>[^/]*)": "AWS::IAM::Role",
+		  "^arn:aws:iam:(?<region>[^:]*):(?<account>[^:]*):policy/(?<id>[^/]*)": "AWS::IAM::Policy",
+		  "^arn:aws:iam:(?<region>[^:]*):(?<account>[^:]*):instance-profile/(?<id>[^/]*)": "AWS::IAM::InstanceProfile",
+		  "^arn:aws:iam:(?<region>[^:]*):(?<account>[^:]*):user/(?<id>[^/]*)": "AWS::IAM::User",
+		  "^arn:aws:iam:(?<region>[^:]*):(?<account>[^:]*):group/(?<id>[^/]*)": "AWS::IAM::Group",
+		  "^arn:aws:cloudformation:(?<region>[^:]*):(?<account>[^:]*):stack//(?<id>[^/]*)": "AWS::CloudFormation::Stack",
+		  "^arn:aws:cloudwatch:(?<region>[^:]*):(?<account>[^:]*):alarm/(?<id>[^/]*)": "AWS::CloudWatch::Alarm",
+		  "^arn:aws:logs:(?<region>[^:]*):(?<account>[^:]*):log-group/(?<id>[^/]*)": "AWS::Logs::LogGroup",
+		  "^arn:aws:events:(?<region>[^:]*):(?<account>[^:]*):rule/(?<id>[^/]*)": "AWS::Events::Rule",
+		  "^arn:aws:apigateway:(?<region>[^:]*):(?<account>[^:]*):/apis/(?<id>[^/]*)": "AWS::ApiGateway::RestApi",
+		  "^arn:aws:apigateway:(?<region>[^:]*):(?<account>[^:]*):/apis/.*/stages/.*$": "AWS::ApiGateway::Stage",
+		  "^arn:aws:codebuild:(?<region>[^:]*):(?<account>[^:]*):project/(?<id>[^/]*)": "AWS::CodeBuild::Project",
+		  "^arn:aws:codecommit:(?<region>[^:]*):(?<account>[^:]*):(?<id>[^/]*)": "AWS::CodeCommit::Repository",
+		  "^arn:aws:codedeploy:(?<region>[^:]*):(?<account>[^:]*):application/(?<id>[^/]*)": "AWS::CodeDeploy::Application",
+		  "^arn:aws:codepipeline:(?<region>[^:]*):(?<account>[^:]*):(?<id>[^/]*)": "AWS::CodePipeline::Pipeline",
+		  "^arn:aws:cognito-idp:(?<region>[^:]*):(?<account>[^:]*):userpool/.*$": "AWS::Cognito::UserPool",
+		  "^arn:aws:cognito-identity:(?<region>[^:]*):(?<account>[^:]*):identitypool/.*$": "AWS::Cognito::IdentityPool",
+		  "^arn:aws:eks:(?<region>[^:]*):(?<account>[^:]*):cluster/(?<id>[^/]*)": "AWS::EKS::Cluster",
+		  "^arn:aws:kinesis:(?<region>[^:]*):(?<account>[^:]*):stream/.*$": "AWS::Kinesis::Stream",
+		  "^arn:aws:kms:(?<region>[^:]*):(?<account>[^:]*):key/.*$": "AWS::KMS::Key",
+		  "^arn:aws:secretsmanager:(?<region>[^:]*):(?<account>[^:]*):secret:.*$": "AWS::SecretsManager::Secret",
+		  "^arn:aws:ssm:(?<region>[^:]*):(?<account>[^:]*):parameter/.*$": "AWS::SSM::Parameter",
+		  "^arn:aws:iam:(?<region>[^:]*):(?<account>[^:]*):oidc-provider/(?<issuer>[^/]*)/id/(?<id>[^/]*)": "AWS::IAM::OIDCProvider",
+		  "^i-[0-9a-f]+$": "AWS::EC2::Instance",
+		  "^vpc-[0-9a-f]+$": "AWS::EC2::VPC",
+		  "^subnet-[0-9a-f]+$": "AWS::EC2::Subnet",
+		  "^sg-[0-9a-f]+$": "AWS::EC2::SecurityGroup",
+		  "^eni-[0-9a-f]+$": "AWS::EC2::NetworkInterface",
+		  "^vol-[0-9a-f]+$": "AWS::EC2::Volume",
+		  "^key-[0-9a-f]+$": "AWS::EC2::KeyPair",
+		  "^ami-[0-9a-f]+$": "AWS::EC2::Image",
+		  "^snap-[0-9a-f]+$": "AWS::EC2::Snapshot",
+		  "^igw-[0-9a-f]+$": "AWS::EC2::InternetGateway",
+		  "^acl-[0-9a-f]+$": "AWS::EC2::NetworkAcl",
+		  "^rtb-[0-9a-f]+$": "AWS::EC2::RouteTable",
+		  "^eip-[0-9a-f]+$": "AWS::EC2::EIP",
+		  "^nat-[0-9a-f]+$": "AWS::EC2::NatGateway",
+		  "^vpce-[0-9a-f]+$": "AWS::EC2::VPCEndpoint",
+		  "^db-[0-9a-z]+$": "AWS::RDS::DBInstance",
+		  "^cluster-[0-9a-z]+$": "AWS::RDS::DBCluster",
+		  "^subgrp-[0-9a-z]+$": "AWS::RDS::DBSubnetGroup",
+		  "^pg-[0-9a-z]+$": "AWS::RDS::DBParameterGroup",
+		  "^lf-[0-9a-z]+$": "AWS::Lambda::Function",
+		  "^table/[0-9a-zA-Z_.-]+$": "AWS::DynamoDB::Table",
+		  #"^[0-9a-z]+-[0-9a-z]+$": "AWS::SQS::Queue",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::SNS::Topic",
+		  #"^lb-[0-9a-z]+$": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+		  #"^targetgroup/[0-9a-zA-Z_.-]+$": "AWS::ElasticLoadBalancingV2::TargetGroup",
+		  #"^listener/[0-9a-z]+$": "AWS::ElasticLoadBalancingV2::Listener",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::AutoScaling::AutoScalingGroup",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::AutoScaling::LaunchConfiguration",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::IAM::Role",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::IAM::Policy",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::IAM::InstanceProfile",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::IAM::User",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::IAM::Group",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::CloudFormation::Stack",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::CloudWatch::Alarm",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::Logs::LogGroup",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::Events::Rule",
+		  #"^[0-9a-f]+$": "AWS::ApiGateway::RestApi",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::ApiGateway::Stage",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::CodeBuild::Project",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::CodeCommit::Repository",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::CodeDeploy::Application",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::CodePipeline::Pipeline",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::Cognito::UserPool",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::Cognito::IdentityPool",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::EKS::Cluster",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::Kinesis::Stream",
+		  #"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$": "AWS::KMS::Key",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::SecretsManager::Secret",
+		  #"^[0-9a-zA-Z_.-]+$": "AWS::SSM::Parameter"
+		}|to_entries) as $map
+
+		|. as $in
+		|(
+			$map[] as $m|($in|capture($m.key)|select(.!={})) // ($in|scan($m.key)|{id:.})|.type=$m.value
+			# |"aws cloudcontrol get-resource --type-name \(.type) --identifier \(.id)"
+			|[$in, .type, .id, .region, .account]|join("\t")
+		) // error("no matcher for \($in)")
+	'
+}
+
+function transform-to-patch {
+	jq -cR '
+		fromjson? // [
+			capture("(?<path>[a-z0-9])=(?<value>.*)")
+			|.path|=gsub("\\.";"/")
+			|.path|="/"+gsub("^/+";"")
+			|{op:"replace",path,value}
+		]
+	'
+}
+
+function auniq {
+	awk '!a[$0]++'
+}
+
+function cat-tests {
+	cat <<- "EOM" 
+		arn:aws:iam::615343348758:policy/allow-cloudwatch-nmcapps-eks-us
+		arn:aws:acm:us-east-1:615343348758:certificate/81d92794-a2e2-41c8-a384-e10fb3bc6b2e
+		arn:aws:iam::615343348758:policy/nmcapps-eks-Namespace-efs-provisioner-ServiceAccount-efs-provisioner
+		arn:aws:iam::615343348758:role/nmcapps-eks-efs-provisioner-efs-provisioner
+		arn:aws:iam::615343348758:policy/AllowExternalDNSUpdates-nmcapps-eks
+		arn:aws:iam::615343348758:role/externalDNSRole-nmcapps-eks
+		arn:aws:eks:us-east-1:615343348758:cluster/nmcapps-eks
+		arn:aws:eks:us-east-1:615343348758:nodegroup/nmcapps-eks/default_nodegroup/bcc63f5a-6b7a-6af1-aa21-a46207121d7b
+		arn:aws:iam::615343348758:instance-profile/nmcapps-eks-workers-role
+		arn:aws:iam::615343348758:role/nmcapps-eks-cluster
+		arn:aws:iam::615343348758:role/nmcapps-eks-nodes
+		arn:aws:ec2:us-east-1:615343348758:launch-template/lt-03ec22afdd4763ec5
+		arn:aws:ec2:us-east-1:615343348758:security-group/sg-0f3cbd029db154cf4
+		arn:aws:ec2:us-east-1:615343348758:security-group/sg-0078da7bd94578c9d
+		arn:aws:iam::615343348758:policy/nmcapps-eks-Namespace-nmcapps-eks-ServiceAccount-nmcapps-eks
+		arn:aws:iam::615343348758:role/nmcapps-eks-nmcapps-eks-nmcapps-eks
+		arn:aws:iam::615343348758:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/30CD7D1EF7ABFEE164682E331509311C
+		i-08020595c9a110cfb
+		i-08020595c9a110cfb
+		xxx
+	EOM
+}
+
+
+
+function usage {
+	cat <<- EOM
+	USAGE
+	  $SCRIPT_NAME COMMAND [OPTIONS] RESOURCE [OPTIONS]
+
+	COMMAND
+
+	  get     Get resources
+	  patch   Patch resources
+	  delete  Delete resources
+
+	OPTIONS
+	  --dry       Dry run
+	  --region    Region
+  	  --profile   Profile
+  	  -p|--patch  Patch to apply
+
+	EXAMPLES
+	  cat RESOURCES | $SCRIPT_NAME   # default will be get
+	  $SCRIPT_NAME -p  i-00e9ce247db23f63b
+
+	NOTES
+	  Patching currently only supports replace operations
+	  Not all resources are supported
+
+	EOM
+}
+
+function bprint {
+	local s=""
+	while (( $# )); do
+		s="${1@Q}"
+		if [[ "'$1'" == "$s" && "$s" != *\ * ]]; then
+			s="$1"
+		fi
+		echo -n "$s "
+		shift
+	done
+}
+
+function main() {
+	local test=0
+	local dry=0
+	local commit=0
+	local operation="get"
+	local patches=()
+	local patch=""
+
+	args=()
+	ids=()
+	while (( $# )); do
+		arg="$1"
+		shift
+		case "$arg" in
+			--region)
+				opt="${1?region}"
+				shift
+				args+=("--region" "$opt")
+				;;
+			--profile)
+				opt="${1?profile}"
+				shift
+				args+=("--profile" "$opt")
+				;;
+			-p|--patch)
+				opt="${1?patch}"
+				shift
+				patches+=("$opt")
+				;;
+			-t|--test)
+				test=1
+				;;
+			--dry|--dry-run)
+				dry=1
+				;;
+			-h|--help)
+				usage; exit 0;;
+			-*|--*)
+				echo "unknown arg: $arg" >&2; exit 1;;
+			get|patch|delete)
+				operation="$arg";;
+			test)
+				test=1;;
+			*)
+				ids+=("$arg");;
+		esac
+	done
+
+	if [[ "$test" -eq 1 ]]; then
+		exec 3< <(cat-tests | map)
+	fi
+	if [[ -p /dev/stdin ]]; then
+		exec 3< <(cat | auniq | map)
+	fi
+	if [[ ! -p /dev/stdin && "${#ids[@]}" -eq 0 ]]; then
+		usage
+		exit 1
+	fi
+		
+	exec 3< <(IFS=$'\n' && echo "${ids[*]}" | auniq | map)
+
+	if [[ "${#patches[@]}" -gt 0 ]]; then
+		patch="$(IFS=$'\n' && echo "${patches[*]}" | transform-to-patch )"
+	fi
+	if [[ "$operation" == "patch" && -z "$patch" ]]; then
+		echo "expected patches" >&2; exit 1;
+	fi
+	
+	while IFS=$'\t' read -u3 -r in type id region _; do
+		# last region option beats!
+		largs=()
+		if [[ -n "$region" ]]; then
+			largs+=("$region")
+		fi
+		if [[ "$operation" == "get" ]]; then
+			command=(aws cloudcontrol get-resource "${args[@]}" "${largs[@]}" --type-name "$type" --identifier "$id")
+		elif [[ "$operation" == "delete" ]]; then
+			command=(aws cloudcontrol delete-resource "${args[@]}" "${largs[@]}" --type-name "$type" --identifier "$id")
+		elif [[ "$operation" == "patch" ]]; then
+			# --patch-document "[{\"op\":\"replace\",\"path\":\"/RetentionInDays\",\"value\":90}]"
+			command=(aws cloudcontrol update-resource "${args[@]}" "${largs[@]}" -p "$patch" --type-name "$type" --identifier "$id")
+		fi
+		if [[ "$dry" -eq 1 ]]; then
+			# echo "# $in" >&2
+			bprint "${command[@]}"
+			continue
+		fi
+		eval "${command[@]}" \
+			| jq --arg in "$in" '.ResourceDescription|{Identifier}*(.Properties|fromjson)'
+	done
+}
+
+main "$@"
