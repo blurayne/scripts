@@ -2,20 +2,102 @@
 
 set -eEuo pipefail
 
- kubectl get nodes -ojson \
- 	| jq -r '.items[]|[
+
+INCLUDE_IMAGES=0
+
+while (( $#  )); do
+	arg="$1"
+	shift
+	case "$arg" in
+		-i|--images|--with-images)
+			INCLUDE_IMAGES=1
+			;;
+		*)
+			printf "error: unknown arg: $arg" >&2;
+			exit 1
+			;;
+	esac
+done
+
+# eksctl utils describe-addon-versions  --cluster NMC_MODELING_SYSTEM-MODELING_SYSTEM  -v 0 | jq -r '.Addons[]|. as $a|.AddonVersions[]|[$a.AddonName,.AddonVersion]|join("\t")' | column -ts $'\t' | sort
+# kubectl get pods -A -ojson | jq -r '[[.items[].spec.nodeName|values|[.]]|group_by(.[0])[]|{(.[0][0]): length}]|add'  
+
+# kubectl get pods -A -ojson | jq -r '[.items|group_by(.spec?.nodeName)[]|group_by(.status.phase)|{(.[0][0].spec?.nodeName // "no-node"): ([.[]|{(.[0].status.phase): length}]|add)}]|add'
+
+# kubectl get pods -A -ojson | jq -r '[.items|group_by(.spec?.nodeName)[]|group_by(.status.phase)|{(.[0][0].spec?.nodeName // "Unschedulable"): ([.[]|{(.[0].status.phase): length}]|add)}]|add' 
+
+
+kubectl get nodes -ojson \
+ 	| jq -r '.items' \
+ 	> /tmp/instances.json
+
+if [[ "$INCLUDE_IMAGES" -eq 1 ]]; then
+	instance_args=($(jq -r ' [.[].spec.providerID|scan("i-.+")]|sort[]' /tmp/instances.json))
+	instance_images_fn="/tmp/instances-$(printf "%s," "${instance_args[@]}"|md5sum|awk '{print $1}').json"
+
+	if [[ ! -e "$instance_images_fn" ]]; then
+		aws ec2 describe-instances --instance-ids "${instance_args[@]}" \
+			| jq '[.Reservations[].Instances[]|{(.InstanceId):.ImageId}]|add' \
+			> "$instance_images_fn"
+	fi
+
+	image_args=($(jq -r '[.[]]|unique|sort[]' "$instance_images_fn"))
+	images_fn="/tmp/images-$(printf "%s," "${image_args[@]}"|md5sum|awk '{print $1}').json"
+	if [[ -e "$images_fn" && ! -s "$images_fn" ]]; then
+		"$images_fn"
+	fi
+	if [[ ! -e "$images_fn" ]]; then
+		aws ec2 describe-images --image-ids "${image_args[@]}"  \
+			 | jq '[.Images[]|{(.ImageId):.}]|add' \
+			 > "$images_fn"
+	fi
+
+	cat /tmp/instances.json \
+		| jq \
+			--slurpfile instanceToImage "$instance_images_fn" \
+			--slurpfile images "$images_fn" \
+			-r '
+				$instanceToImage[0] as $instanceToImage
+				|$images[0] as $images
+				|.[]
+				|(.spec.providerID|scan("i-.+")) as $instance
+				|($instanceToImage[$instance] // "") as $ami
+				|($images[$ami] // {}) as $image
+				|[
+	 				.metadata.name,
+	 				# .metadata.nnotations["alpha.kubernetes.io/provided-node-ip"],
+	 				(.spec.providerID|scan("i-.+")),
+	 				.metadata.labels.["topology.kubernetes.io/region"],
+	 				.metadata.labels.["node.kubernetes.io/instance-type"],
+	 				.status.nodeInfo.architecture,
+	 				([.spec.taints[]?.effect]|unique|join(",")),
+	 				.status.nodeInfo.osImage,
+	 				.status.nodeInfo.kernelVersion,
+	 				$ami,	
+	 				$image.ImageLocation
+	 				
+	 			]|join("\t")' \
+	 	| sed '1iNAME\tPROVIDER ID\tREGION\tTYPE\tARCH\tSTATUS\tOS\tKERNEL\tAMI\tIMAGE' \
+	 	| column -ts $'\t'
+
+	exit 0
+fi
+
+
+cat /tmp/instances.json \
+	| jq -r '.[]|[
  				.metadata.name,
+ 				# .metadata.nnotations["alpha.kubernetes.io/provided-node-ip"],
  				(.spec.providerID|scan("i-.+")),
  				.metadata.labels.["topology.kubernetes.io/region"],
+ 				([.spec.taints[]?.effect]|unique|join(",")),
  				.metadata.labels.["node.kubernetes.io/instance-type"],
  				.status.nodeInfo.architecture,
  				.status.nodeInfo.kubeletVersion,
  				.status.nodeInfo.kubeProxyVersion,
- 				.status.conditions[-1].reason
+ 				.status.nodeInfo.osImage,
+ 				.status.nodeInfo.kernelVersion
  	]|join("\t")' \
- 	| sed '1iNAME\tPROVIDER ID\tTYPE\tREGION\tARCH\tKUBELET\tKUBEPROXY\tSTATUS' \
+ 	| sed '1iNAME\tPROVIDER ID\tREGION\tTYPE\tSTATUS\tARCH\tKUBELET\tKUBEPROXY\tOS\tKERNEL' \
  	| column -ts $'\t'
-
-
-
 
