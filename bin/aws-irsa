@@ -23,11 +23,12 @@ OIDC_PROVIDER_ARN=""
 OPT_CHECK_ONLY=0
 OPT_APPLY=0
 CONTEXT=""
-NAMESPACE="steampipe"
-SA_NAME=""
+NAMESPACE="kube-system"
+SA_NAME="default"
 K8S_ROLE_NAME=""
-ROLE_NAME=""
+ROLE_NAME="default"
 ROLE_ARN=""
+COMMAND=""
 
 function err() {
 	printf "\e[1m\e[31m\e[38;2;255;0;0m%s\x1b[0m\n" "${1?message}" >&2
@@ -107,95 +108,8 @@ req-bin() {
 # --cache use context cache
 # get-info --output json
 
-function parse-args {
-	local opt=""
-  while [[ $# -gt 0 ]]; do
-		arg="$1"
-		shift 1
-		case "$arg" in
 
-			-p|--profile) 
-				export AWS_PROFILE="${1?profile}"
-				shift 1
-				;;
-
-			-c|--context) 
-				export CONTEXT="${1?k8s-context}"
-				shift 1
-				;;
-
-			-n|--namespace) 
-				export NAMESPACE="${1?k8s-namespace}"
-				shift 1
-				;;
-
-			-C|--check) 
-				OPT_CHECK_ONLY=1
-				OPT_APPLY=0
-				;;
-
-			-K|--apply|--fix) 
-				OPT_APPLY=1
-				;;
-
-			-sa|--service-account-name) 
-				export SA_NAME="${1?k8s-service-account}"
-				shift 1
-				;;
-
-			--no-k8s-role)
-				;;
-
-			-r|--iam-role|--iam-role-arn) 
-				opt="${1?iam-role}"
-				shift 1
-				if [[ "$opt" == arn* ]]; then
-					ROLE_ARN="${opt}"
-					ROLE_NAME="${opt%/*}"
-				else
-					ROLE_NAME="${opt}"
-				fi
-				;;
-
-			-[a-z]*)
-				set -- $(for ((i=1; i<${#arg}; i++ )); do echo " -${arg:$i:1}"; done) "$@"
-				;;
-
-			# --assume-other-roles -> hint
-
-
-			-*)
-				raise-err "unknown option $arg"
-				exit 1; 
-				;;
-
-			*)
-				raise-err "unknown argument $arg"
-				exit 1; 
-				;;
-		esac
-	done
-
-
-	if [[ -z "$NAMESPACE" ]]; then
-		NAMESPACE="$(kubectl config view --minify -o jsonpath='{..namespace}')"
-	fi
-	if [[ -z "$CONTEXT" ]]; then
-		CONTEXT="$(kubectl config current-context)"
-	fi
-	if [[ -z "$NAMESPACE" ]]; then
-		raise-err "$BASENAME: namespace is required"
-	fi
-	if [[ -z "$CONTEXT" ]]; then
-		raise-err "$BASENAME: context is required"
-	fi
-	if [[ -z "$ROLE_NAME" ]] && [[ -z "$SA_NAME" ]]; then
-		raise-err "$BASENAME: Role Name or Service-Account name is required"
-	fi
-}
-
-
-function collect-env {
+function gather-env-info {
 	title "Collecting k8s cluster information:"
 	info "K8s Context: $CONTEXT"
 	read -r K8S_DISTRO AWS_REGION AWS_X_ACCOUNT_ID CLUSTER_NAME	_	\
@@ -222,16 +136,6 @@ function collect-env {
 	THUMBPRINT=$(openssl x509 -fingerprint -noout -in $ROOT_CA | sed 's/^.*=//' | sed 's/://g')
 	info "Thumbprint: $THUMBPRINT"
 	rm -rf $TEMP
-}
-
-function init {
-	parse-args "$@"
-	collect-env
-	setup-env
-}
-
-
-function setup-env {
 	if [[ -n "$ROLE_NAME" ]] && [[ -z "$SA_NAME" ]]; then
 		SA_NAME="$(jq -rRe 'camel_to_kebab' <<< "$ROLE_NAME")"
 	fi
@@ -243,6 +147,7 @@ function setup-env {
 	info "Namespace: $NAMESPACE"
 	info "Service Account: $SA_NAME"
 }
+
 
 function setup-service-account {
 	local sa_json="$(kubectl get sa -n $NAMESPACE -ojson $SA_NAME  2>&1 | (grep -v 'NotFound' || true))"
@@ -288,6 +193,7 @@ function check-idp {
 	OIDC_PROVIDER_JSON="$(aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$OIDC_PROVIDER_ARN" --region "$AWS_REGION" 2>&1 | (grep -v 'NoSuchEntity' || true))"
 	# .ClientIDList": [
 	# .ThumbprintList": [
+	echo $OIDC_PROVIDER_JSON
 	if [[ -n "$OIDC_PROVIDER_JSON" ]]; then
 		info "found $OIDC_PROVIDER_ARN"
 	else
@@ -451,20 +357,59 @@ function get-all-thumbprints {
 	done
 }
 
+function assumed-role-2-role {
+	jq -Rre 'capture("arn:aws:sts:(?<region>[^:]*):(?<account>[^:]*):assumed-role/(?<role>[^/]*)")|"arn:aws:iam::\(.account):role/\(.role)"' 
+}
 
-function test-sa {
-	set -x
+
+function check-sa {
 	local tmp="$(mktemp -d)"
 	pod="testing-$(openssl rand -hex 8)"
-	kubectl run -n "$NAMESPACE" --wait=true --image=amazon/aws-cli:latest --pod-running-timeout=60m \
+	(
+		set -x;
+		kubectl run -n "$NAMESPACE" --wait=true --image=amazon/aws-cli:latest --pod-running-timeout=60m \
 		--overrides="$(jq -rnc --arg sa "$SA_NAME" '.apiVersion="v1"|.metadata.labels.app="debug"|.spec.serviceAccount=$sa')" \
 	 "$pod" --command -- sleep infinity
-   # kubectl wait --for=condition=complete --timeout=30s pod/$pod -n $NAMESPACE 
-  kubectl exec -it -n "$NAMESPACE" "$pod" -- aws sts get-caller-identity | tee "$tmp/auth.json"
-	
- 	kubectl logs -n "$NAMESPACE"  "$pod" 
+	 )
+  set -x
+  kubectl wait --for=condition=Ready --timeout=30s pod/$pod -n $NAMESPACE  || (kubectl logs -n "$NAMESPACE"  "$pod"; raise-err "Error executing pod")
+
+  # .[?1h.=.{.[m..  
+
+
+	TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600") \
+		&& curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/
+
+  kubectl exec -it -n "$NAMESPACE" "$pod" -- aws sts get-caller-identity --no-cli-pager --output json | tee "$tmp/auth.json"	
+  assumed_role_arn="$(jq -r '.Arn' "$tmp/auth.json"	| assumed-role-2-role)"
+	echo "Got $assumed_role_arn"
+ 	# 
   # arn:aws:sts::141903343889:assumed-role/steampipe/botocore-session-1688418713
- 	kubectl get pod "$pod" -n "$NAMESPACE" -ojson | jq -er '.spec.containers[].env|from_entries'
+ 	kubectl get pod "$pod" -n "$NAMESPACE" -ojson | jq -er '.spec.containers[].env // {}|from_entries|[.key,.value]|join("\t")' | tee "$tmp/env.tsv"
+	if ! grep -q AWS_WEB_IDENTITY_TOKEN_FILE "$tmp/env.tsv"; then
+			raise-err "No AWS_WEB_IDENTITY_TOKEN_FILE was written, therefore IRSA not in effect!"
+	fi
+
+
+
+  while IFS= read -r key value _; do
+  	echo "$key $value"
+  	case "$key" in
+			AWS_ROLE_ARN)
+				if [[ "$value" != "$ROLE_ARN" ]]; then
+					raise-err "Role ARN: expected: $ROLE_ARN, got: $value"
+				fi
+				;;
+			AWS_REGION)
+				if [[ "$value" != "$AWS_REGION" ]]; then
+					raise-err "Role ARN: expected: $ROLE_ARN, got: $value"
+				fi
+				;;
+			AWS_WEB_IDENTITY_TOKEN_FILE)
+				
+		esac
+  done < "$tmp/env.tsv"
+ 	 # kubectl delete pod -A -l app=debug --dry-run=client                 
  	# if pod was launched correctly it should have AWS_ROLE_ARN from serviceaccount
  	#json.items[82].spec.containers[0].env[0].name = "AWS_DEFAULT_REGION";
 	#json.items[82].spec.containers[0].env[0].value = "us-east-1";
@@ -495,35 +440,47 @@ function cleanup-debug-pod {
 		|  xargs -L1 sh -c 'kubectl -n $0 delete pod $1'
 }
 
+
 function pass-thru {
-	while [[ $#  -gt 0 ]]:; do
- 		--context)
-			;;
- 		--namespace)
- 			gitlab-runners
- 			;;
- done
+	true
 }
 
 function list-sa-with-role-arn {
 	kubectl get sa -ojson | jq -r '.items[].metadata|.annotations["eks.amazonaws.com/role-arn"] as $arn|[.namespace, .name, $arn // "No ARN"]|@tsv' | column -ts $'\t'
 }
 
-init "$@"
-# check-idp
-#setup-service-account
-test-sa
+function create-trust-relationship-policy {
+	cat <<-EOM
+	{
+	  "Version": "2012-10-17",
+	  "Statement": [
+	      {
+	          "Effect": "Allow",
+	          "Principal": {
+	              "Federated": "arn:aws:iam::${AWS_X_ACCOUNT_ID}:oidc-provider/oidc.eks.${AWS_REGION}.amazonaws.com/id/${THUMBPRINT}"
+	          },
+	          "Action": "sts:AssumeRoleWithWebIdentity",
+	          "Condition": {
+	              "StringEquals": {
+	                  "${OIDC_PROVIDER_URL#*//}:sub": "system:serviceaccount:kube-system:${SA_NAME}",
+	                  "${OIDC_PROVIDER_URL#*//}:aud": "sts.amazonaws.com"
+
+	              }
+	          }
+	      },
+	EOM
+}
 
 
-### https://oblcc.com/blog/configure-openid-connect-for-gitlab-and-aws/
 
-function xx {
+function create-role-policy {
+	### https://oblcc.com/blog/configure-openid-connect-for-gitlab-and-aws/
 	cat <<-EOM 
 	{
 		"Version": "2012-10-17",
 		"Statement": [       
 			{
-				"Sid": "GitLabPolicy",
+				"Sid": "Basic",
 				"Effect": "Allow",
     	 	"Action": "sts:GetCallerIdentity",
   	   	"Resource": "*"
@@ -532,3 +489,142 @@ function xx {
 	}
 	EOM
 }
+
+
+function check-trust {
+	 aws iam get-role --role-name  config-manager-service-account | jq -r '.Role.AssumeRolePolicyDocument'
+
+
+}
+
+function parse-args {
+	local opt=""
+  while [[ $# -gt 0 ]]; do
+		arg="$1"
+		shift 1
+		case "$arg" in
+
+			-p|--profile) 
+				export AWS_PROFILE="${1?profile}"
+				shift 1
+				;;
+
+			-c|--context) 
+				export CONTEXT="${1?k8s-context}"
+				shift 1
+				;;
+
+			-n|--namespace) 
+				export NAMESPACE="${1?k8s-namespace}"
+				shift 1
+				;;
+
+			-C|--check) 
+				OPT_CHECK_ONLY=1
+				OPT_APPLY=0
+				;;
+
+			-K|--apply|--fix) 
+				OPT_APPLY=1
+				;;
+
+			-sa|--service-account-name) 
+				export SA_NAME="${1?k8s-service-account}"
+				shift 1
+				;;
+
+			--no-k8s-role)
+				;;
+
+			-r|--iam-role|--iam-role-arn|--arn) 
+				opt="${1?iam-role}"
+				shift 1
+				if [[ "$opt" == arn* ]]; then
+					ROLE_ARN="${opt}"
+					ROLE_NAME="${opt%/*}"
+				else
+					ROLE_NAME="${opt}"
+				fi
+				;;
+
+			-[a-z]*)
+				set -- $(for ((i=1; i<${#arg}; i++ )); do echo " -${arg:$i:1}"; done) "$@"
+				;;
+
+			# --assume-other-roles -> hint
+
+
+			-*)
+				raise-err "unknown option $arg"
+				exit 1; 
+				;;
+
+			trust|get-trust|get-trust-policy|get-trust-relationship)
+				COMMAND="get-trust-relationship"
+				;;
+
+			check-sa)
+				COMMAND="check-sa"
+				;;
+
+			check-idp)
+				COMMAND="check-idp"
+				;;
+
+			*)
+				raise-err "unknown argument $arg"
+				exit 1; 
+				;;
+		esac
+	done
+
+
+	if [[ -z "$NAMESPACE" ]]; then
+		NAMESPACE="$(kubectl config view --minify -o jsonpath='{..namespace}')"
+	fi
+	if [[ -z "$CONTEXT" ]]; then
+		CONTEXT="$(kubectl config current-context)"
+	fi
+
+	if [[ -z "$NAMESPACE" ]]; then
+		raise-err "$BASENAME: namespace is required"
+	fi
+	if [[ -z "$CONTEXT" ]]; then
+		raise-err "$BASENAME: context is required"
+	fi
+	#if [[ -z "$ROLE_NAME" ]] && [[ -z "$SA_NAME" ]]; then
+	#	raise-err "$BASENAME: Role Name or Service-Account name is required"
+	# fi
+}
+
+
+
+function main {
+	parse-args "$@"
+	gather-env-info
+
+	check-idp
+	# test-sa
+	# 
+
+	case "$COMMAND" in
+		get-trust-relationship)
+			create-trust-relationship-policy
+			;;
+		setup-service-account)
+			;;
+		check-idp)
+			check-idp;;
+		check-sa)
+			check-sa;;
+		*)
+			raise-err "unknown command $COMMAND"
+	esac
+}
+
+
+
+main "$@"
+
+
+
