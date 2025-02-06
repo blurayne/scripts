@@ -96,6 +96,7 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--get-config-file)
 			get_default_config_file
+			exit 0
 			;;
 		--runtime)
 			arg="${1?runtime}"
