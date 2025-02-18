@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+
+##
+# Validate ansible config
+
+set -eEuo pipefail
+
+known="$(ansible-config list -t all --format json | jq 'reduce .[].ini[]? as $i ({};.["\($i.section)"] |= . + [$i.key])')"
+
+errors="$(
+	ansible-config view  | jq -r --argjson "known" "$known" -Rs '
+		def ini_to_json:
+			split("\n")|map(select(length > 0))
+			| map(match("\\[(?<section>.+)\\]|(?!^\\s*#)(?<sub>\\s*)(?<key>.+?)\\s*=\\s*(?<value>.+)\\s*|(?<subsection>.+?)\\s*=\\s*$") )
+			| map(reduce .captures[] as $i ({};.[$i.name]=$i.string))
+			|reduce .[] as $i ({ section: "", subsection: "", config: {} };
+				if ($i.section) then
+					.section=$i.section
+					|.config[$i.section] = {}
+				elif ($i.key and $i.value and .section) then
+					if ($i.sub!="" and .subsection) then
+						.config[.section][.subsection][$i.key] = $i.value
+					else
+						(
+							if (.subsection and ($i.sub|length==0)) then
+								.subsection = null
+							else
+							.
+							end
+						)
+						|.config[.section][$i.key] = $i.value
+					end
+		        elif ($i.key and $i.value) then
+					.config[$i.key] = $i.value
+				elif ($i.subsection and .section=="default") then
+		        	.subsection = $i.subsection
+		        else
+		           .
+		        end
+			)
+			|.config as $config
+			|$config|map_values(
+				if ((.|type == "object") and .source_profile and $config["profile "+.source_profile]) then
+		     		. = ($config["profile "+.source_profile] * .)
+		     	else
+		     		.
+		     	end
+		  	);
+
+		ini_to_json|to_entries[]
+		|.key as $section
+		|.value|to_entries[]
+		|.key as $key
+		|if ($known[$section]|arrays|contains([$key])|not) then " \($section):\(.key)" else empty end
+	')"
+
+if [[ -n "$errors" ]]; then
+	cat <<- EOM
+	I found following unknown keys in your ansible.cfg:
+
+	${errors}
+
+
+	Use 'ansible-config list -t all' or https://docs.ansible.com/ansible/latest/reference_appendices/config.html to review possible settings!
+	EOM
+	exit 1
+fi
+
+echo "Your ansible.cfg looks absolutly fine!"
+
+
