@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+(
+    kubectl get pods --field-selector=status.phase=Pending -A -ojson | jq -c '.items[]';
+    kubectl get deployments -ojson -A | jq -c '.items[]';
+    kubectl get replicasets -ojson -A | jq -c '.items[]';
+    kubectl get daemonsets -ojson -A | jq -c '.items[]';    
+) | jq -r '
+        def parse_oci_image:
+            . as $i
+            |capture(
+                "^((?<host>[a-zA-Z0-9-]+\\.[a-zA-Z0-9.-]+)/)?"
+                + "(:(?<port>[0-9]+))?"
+                + "((?<path>[a-zA-Z0-9-._/]+)/)?"
+                + "(?<image>[a-zA-Z0-9-._]+)"
+                + "((:(?<tag>[a-z0-9_.-]+))|(@(?<digest>sha256:[a-z0-9]+)))?$"
+            ) // error("couldnt parse \($i)");
+
+        def qualify_oci_image:
+            if (.host==null) then .host="docker.io" end
+            |if (.path==null and .host=="docker.io") then .path="library" end;
+
+        def proxy_oci_image($p):
+            . as $i
+            |parse_oci_image    
+            |if (.host==null) then "\($p)/\($i)" else $i end;
+        
+        [
+            ..|objects|(.initContainers[]?,.containers[]?)
+            |(.image|proxy_oci_image("mirror.gcr.io")) as $newImage
+            |if (.image!=$newImage) then "\(.name)=\($newImage)" else empty end
+        ] as $p
+        |if ($p|length > 0) then "kubectl set image \(.kind) -n \(.metadata.namespace) \(.metadata.name) \($p|join(" "))" else empty end
+        
+    '  
+
