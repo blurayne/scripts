@@ -14,6 +14,7 @@ shopt -s inherit_errexit
 
 function main() {
     local search="${1?image-path-prefix-with-docker-io}"
+    local regex="${2:-.+}"
     local repo="${search%%@*}"
     local found=0
     local shas=()
@@ -28,11 +29,13 @@ function main() {
     printf "found:\n"
     printf "%s\n" "${shas[@]}"
     printf "Iterating through tags\n"  >&2
-    tags=($(skopeo list-tags docker://${repo} | jq -er '.Tags[]'))
+    tags=($(skopeo list-tags docker://${repo} | jq -er '.Tags[]' | grep -P "${regex}"))
     total="${#tags[@]}"
     for tag in "${tags[@]}"; do
       let 'current += 1'
-      digest="$(skopeo inspect --raw docker://${repo}:${tag} | jq -re '.config.digest')"
+      digest="$(skopeo inspect --raw docker://${repo}:${tag} | jq -re '.config.digest' || true)"
+      if [[ -z "$digest" ]]; then continue; fi
+      # TODO v1 manifest docker://docker:1.0
       printf "\33[2K\r[$current/$total] Checking $tag" >&2
       for sha in ${shas[@]}; do
         if [[ "$digest" == "$sha" ]]; then
