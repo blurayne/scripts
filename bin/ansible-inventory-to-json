@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+
+from ansible.parsing.dataloader import DataLoader
+from ansible.inventory.manager import InventoryManager
+import argparse
+import json
+
+def get_expanded_hostnames(inventory):
+    expanded_hostnames = {"all": []}
+    for group in inventory.groups.values():
+        hosts = []
+        for host in group.get_hosts():
+            hosts.append(host.get_name())
+        expanded_hostnames["all"] += hosts
+        expanded_hostnames[group.name] = hosts
+    return expanded_hostnames
+
+def main():
+    parser = argparse.ArgumentParser(description='Expand Ansible inventory hostnames')
+    loader = DataLoader()
+    parser.add_argument('inventory', metavar='INVENTORY', type=str, default='hosts', nargs='?',
+                        help='path to the Ansible inventory file')
+    args = parser.parse_args()
+    inventory = InventoryManager(loader=loader, sources=[args.inventory])
+    expanded_hostnames = get_expanded_hostnames(inventory)
+    json_output = json.dumps(expanded_hostnames, indent=2)
+    print(json_output)
+
+if __name__ == '__main__':
+    main()
