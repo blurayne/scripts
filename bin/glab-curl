@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+GITLAB_TOKEN="${GITLAB_TOKEN?GITLAB_TOKEN}"
+
+args=(-H "PRIVATE-TOKEN: $GITLAB_TOKEN")
+api_prefix="https://gitlab.com/api/v4/"
+bin="$(command -v restish curl | head -1)"
+
+while [[ "$#" -gt 0 ]]; do
+	arg="$1"
+	shift 1
+	case "$arg" in
+		/*)
+			args+=("${api_prefix%/}/${arg#/}")
+			;;
+		*)
+			if [[ "$arg" =~ ^[a-zA-Z0-9_-]+/?[a-zA-Z0-9_-]* ]]; then
+				args+=("${api_prefix%/}/${arg#/}")
+				continue
+			fi
+			args+=("$arg")
+	esac
+done
+
+"$bin" "${args[@]}" 
+

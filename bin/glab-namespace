@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+function get-gitlab-namespace {
+	local namespace="${1?namespace}"
+	namespace="${namespace#/*}"
+	namespace="${namespace%*/}"
+	# first call is to check if token is valid
+	curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/user" 1>/dev/null \
+		&& (curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/groups/$(jq -Rr @uri <<< "$namespace")/" 2>/dev/null | jq --arg ns "$namespace" '{id, name, path: .full_path, description, type:"group"}')  \
+		|| (curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/$(jq -Rr @uri <<< "$namespace")/" 2>/dev/null | jq --arg ns "$namespace"  '{id, name, path: .path_with_namespace, description, type:"project"}') \
+		|| (echo "error: namespace ${namespace} could not be found!" >&2; exit 1)
+}
+
+
+if [[ $# -eq 0 ]]; then
+
+	git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+	if [[ -e "$git_root/.git/config" ]]; then
+		while read -r project _; do
+			if [[ -n "$project" ]]; then
+				get-gitlab-namespace "$project" 2>/dev/null && exit 0
+			fi
+		done < <(cat "$git_root/.git/config" | jq -Rr 'capture("git@(?=.*gitlab)([^:]+):(?<project>(([^/]+/))+[^\\.]+)(\\.git)?")|.project')
+		
+	fi
+fi
+
+get-gitlab-namespace "$@"

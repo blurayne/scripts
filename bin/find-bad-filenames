@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+# LC_ALL=C find . -type f -exec grep -c -P -n "[\x00-\x08\x0E-\x1F\x80-\xFF]" {} + 
+LC_ALL=C find / -type f 2>/dev/null | grep -P "[\x00-\x08\x80-\xFF]"
