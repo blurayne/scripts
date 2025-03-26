@@ -78,6 +78,7 @@ import io
 import pathlib
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.parsing.vault import VaultLib, VaultSecret
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
 import ruamel.yaml
 from collections import OrderedDict
 from benedict import benedict
@@ -112,6 +113,7 @@ class App:
     file_exists: bool = False
     vault: VaultLib = None
     rekey_vault: VaultLib = None
+    root_is_list: bool = False
 
     def usage(self):
         self.parser.print_help()
@@ -268,7 +270,15 @@ class App:
         self.yaml.constructor.add_constructor(u'!vault', self.vault_string_constructor)
         self.yaml.representer.add_representer(VaultString, self.vault_string_representer)
         self.yaml_data = self.yaml.load(self.original_content)
-        self.yaml_accessor = benedict(self.yaml_data)
+        
+        if isinstance(self.yaml_data, list):
+            yaml_data = self.yaml_data
+            self.yaml_data = CommentedMap()
+            self.yaml_data["items"] = yaml_data
+            self.root_is_list= True
+            if self.args.path:
+                self.args.path = "items" + self.args.path        
+        self.yaml_accessor = benedict(dict(self.yaml_data))
 
         # after loading set rekey vault
         if self.args.rekey:
@@ -289,8 +299,8 @@ class App:
         elif self.args.path and self.args.value:
             # self.check_path_exists(self.args.path)
             if self.args.decrypt:
-                print(f"path {self.args.path}: decrypt but setting value?", file=sys.stderr)
-                sys.exit(1)            
+                self.yaml_accessor[self.args.path] = str(self.args.value)
+                
             if self.args.encrypt:
                 self.yaml_accessor[self.args.path] = self.encrypt(str(self.args.value), self.vault, prefix=f"path {self.args.path}: ")
             else:
@@ -341,6 +351,10 @@ class App:
     def dump(self):
         try:
             self.yaml.dump(self.yaml_data, sys.stdout)
+            if self.root_is_list:
+                self.yaml.dump(self.yaml_data['items'], sys.stdout)
+            else:
+                self.yaml.dump(self.yaml_data, sys.stdout)
         except Exception as e:
             print(e, file=sys.stderr)
             print("Decoding failed", file=sys.stderr)

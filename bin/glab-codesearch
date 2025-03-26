@@ -31,6 +31,7 @@ COLORIZE=-1
 PER_PAGE=100 # 100 is gilab's max page size
 VERSION="0.1"
 OPT_MARKDOWN=0
+OPT_PAGER=0
 
 ##
 # compare one version against another
@@ -216,7 +217,7 @@ function hypercurl {
 	
 	
 	curl -sSfL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$url" -D "$TMP/headers" | jq -c '.[]' > "$TMP/results.jsonl"
-	source /dev/stdin < "$TMP/var" 
+	source /dev/stdin < "$TMP/var" || (rc=$?; cat "$TMP/headers" >/dev/stderr || true; exit "$rc")
 	expected_results=$((total_pages * per_page))
 	
 	if [[ "$ALWAYS_YES" -ne 1 ]] && [[ "$expected_results" -gt "$RESULTS_LIMIT" ]]; then
@@ -477,6 +478,14 @@ function init-args {
 				fi
 				shift 1
 				;;
+			
+			-l|--pager)
+				OPT_PAGER=1
+				;;
+			--no-pager)
+				OPT_PAGER=0
+				;;
+
 			-A|--after)
 				LINES_AFTER="${1?after}"
 				if [[ $LINES_AFTER -gt $GLAB_LINES_AFTER ]]; then
@@ -696,8 +705,10 @@ function request {
 	#timeout 60 restish -rojson -f body \
 	#	-H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
 	#	"https://gitlab.com/api/v4/${ID_FRAGMENT}/search?size=100&scope=blobs&search=$(jq -Rr @uri <<< "${SEARCH_QUERY}")" \
-  #	| jq -c '.[]' \
+    #   | jq -c '.[]' \
 	#	> "$TMP/results.jsonl"
+	#jless "$TMP/results.jsonl" 
+	#exit 1
 
 	
 	url="https://gitlab.com/api/v4/${ID_FRAGMENT}/search?per_page=$PER_PAGE&scope=blobs&search=$(jq -Rr @uri <<< "${SEARCH_QUERY}")"
@@ -750,6 +761,7 @@ function request {
 			$g[]
 			|if (.startline=null) then (.startline=1|.onlyfilematch=true) end
 			|(if (($linesbefore+$linesafter+1) < $linecnt) then (.startline+$linesbefore) else (.startline-1) end) as $matchline
+			|(if ($matchline==0 and .startline>0) then (.startline+$linesbefore) else $matchline end) as $matchline
 			|{startline,matchline:$matchline,data}
 		]
 		|.tmpfile="\($tmp)/dl/\(.project_path)/-/\(.path)"  # +"@"+.ref
@@ -795,6 +807,11 @@ function request {
 				raise-error "$tmpfile does not exist"	
 			fi
 			buffer="$(<"$tmpfile")"
+			if [[ "${#buffer}" -gt 100000 ]]; then 
+				printf "\e[2K\Skipping %s (%d bytes)" "$tmpfile" "${#buffer}"	
+				continue; 
+			fi
+
 			printf "\e[2K\rFiltering %s (%d bytes)" "$tmpfile" "${#buffer}" >&2
 			printf "%s\1%s\n" "${buffer//$'\n'/$'\2'}" "$json" 
 		done < <(jq -r '[.tmpfile, @json]|join("\t")' "$TMP/results.jsonl" ) \
@@ -1162,6 +1179,12 @@ function main() {
 	debug "Temp directory is $TMP. Not cleaning up!" 
 	
 	init-args "$@"
+
+	# Pager shortcut
+	if [[ "$OPT_PAGER" -eq 1 ]]; then
+		"${0}" "$@" --color --no-pager > "$TMP/results.txt"
+		eval exec "${PAGER:-less -R}" "$TMP/results.txt"
+	fi
 	
 	init-detect-language-by-ext
 
